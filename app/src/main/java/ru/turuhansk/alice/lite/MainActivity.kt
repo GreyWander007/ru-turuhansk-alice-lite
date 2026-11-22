@@ -1,5 +1,6 @@
 package ru.turuhansk.alice.lite
 
+import android.annotation.SuppressLint
 import android.os.Bundle
 import android.view.View
 import android.webkit.CookieManager
@@ -7,6 +8,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
@@ -16,48 +18,53 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var btnRefresh: Button
     private lateinit var progressBar: View
+    private lateinit var errorText: TextView
+    private var webviewReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_main)
+        try {
+            super.onCreate(savedInstanceState)
+            setContentView(R.layout.activity_main)
 
-        webView = findViewById(R.id.webView)
-        btnRefresh = findViewById(R.id.btnRefresh)
-        progressBar = findViewById(R.id.progressBar)
+            webView = findViewById(R.id.webView)
+            btnRefresh = findViewById(R.id.btnRefresh)
+            progressBar = findViewById(R.id.progressBar)
+            errorText = findViewById(R.id.errorText)
 
-        btnRefresh.setOnClickListener { webView.reload() }
-
-        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
-            override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else finish()
+            btnRefresh.setOnClickListener {
+                errorText.visibility = View.GONE
+                webView.reload()
             }
-        })
 
-        setupWebView()
+            onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (webviewReady && webView.canGoBack()) webView.goBack() else finish()
+                }
+            })
 
-        if (savedInstanceState != null) {
-            webView.restoreState(savedInstanceState)
-        } else {
-            webView.loadUrl("https://alice.yandex.ru")
+            setupWebView()
+
+            if (savedInstanceState != null) {
+                webView.restoreState(savedInstanceState)
+                webviewReady = true
+            } else {
+                webView.loadUrl("https://alice.yandex.ru")
+            }
+        } catch (e: Throwable) {
+            showCrash(e)
         }
     }
 
-    override fun onSaveInstanceState(outState: Bundle) {
-        webView.saveState(outState)
-        super.onSaveInstanceState(outState)
-    }
-
+    @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView() {
         val s = webView.settings
         s.javaScriptEnabled = true
         s.domStorageEnabled = true
         s.databaseEnabled = true
 
-        // Lite-режим: без картинок, экономия трафика
         s.loadsImagesAutomatically = false
         s.blockNetworkImage = true
 
-        // Кэш-первым: при плохой связи показываем кэш
         s.cacheMode = WebSettings.LOAD_CACHE_ELSE_NETWORK
 
         s.userAgentString =
@@ -74,13 +81,17 @@ class MainActivity : AppCompatActivity() {
 
     fun showLoading(show: Boolean) {
         runOnUiThread {
-            progressBar.visibility = if (show) View.VISIBLE else View.GONE
-            if (show) btnRefresh.visibility = View.GONE
+            try {
+                progressBar.visibility = if (show) View.VISIBLE else View.GONE
+                if (show) btnRefresh.visibility = View.GONE
+            } catch (_: Throwable) { }
         }
     }
 
     fun hideError() {
-        runOnUiThread { btnRefresh.visibility = View.GONE }
+        runOnUiThread {
+            try { btnRefresh.visibility = View.GONE } catch (_: Throwable) { }
+        }
     }
 
     private fun showError() {
@@ -97,12 +108,35 @@ class MainActivity : AppCompatActivity() {
             "Иногда страницы любят, чтобы их подождали. Нажмите «Обновить» — проявим немного терпения.",
             "Всё под контролем: просто сеть решила устроить тихий час. Обновим, когда будет готова.",
             "Связь сегодня не в настроении. Обновите — посмотрим, стало ли лучше."
-            "Сегодня Котэ на смене, извините, мы его заменим. Обновите — уже вышел другой мастер."
+            "Сегодня Котэ на смене, изнивите, сейчас выпнем и оправим нового мастера, попробуйте обновить."
         )
         runOnUiThread {
+            try {
+                progressBar.visibility = View.GONE
+                btnRefresh.visibility = View.VISIBLE
+                Toast.makeText(this, jokes.random(), Toast.LENGTH_LONG).show()
+            } catch (_: Throwable) { }
+        }
+    }
+
+    private fun showCrash(e: Throwable) {
+        val text = buildString {
+            append("Ошибка запуска:\n")
+            append(e.javaClass.simpleName).append(": ").append(e.message ?: "(нет сообщения)")
+            e.stackTrace.take(6).forEach { append("\n").append(it.toString()) }
+            e.cause?.let {
+                append("\n\nПричина: ").append(it.javaClass.simpleName)
+                append(": ").append(it.message ?: "(нет сообщения)")
+            }
+        }
+        try {
+            errorText.text = text
+            errorText.visibility = View.VISIBLE
             progressBar.visibility = View.GONE
-            btnRefresh.visibility = View.VISIBLE
-            Toast.makeText(this, jokes.random(), Toast.LENGTH_LONG).show()
+            btnRefresh.visibility = View.GONE
+            webView.visibility = View.GONE
+        } catch (_: Throwable) {
+            try { Toast.makeText(this, text.take(400), Toast.LENGTH_LONG).show() } catch (_: Throwable) { }
         }
     }
 }

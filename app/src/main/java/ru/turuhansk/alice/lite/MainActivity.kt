@@ -1,6 +1,7 @@
 package ru.turuhansk.alice.lite
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.os.Bundle
 import android.view.View
 import android.webkit.CookieManager
@@ -15,6 +16,10 @@ import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val CRASH_FILE = "crash_log.txt"
+    }
+
     private lateinit var webView: WebView
     private lateinit var btnRefresh: Button
     private lateinit var progressBar: View
@@ -22,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private var webviewReady = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installCrashCatcher()
         try {
             super.onCreate(savedInstanceState)
             setContentView(R.layout.activity_main)
@@ -33,7 +39,8 @@ class MainActivity : AppCompatActivity() {
 
             btnRefresh.setOnClickListener {
                 errorText.visibility = View.GONE
-                webView.reload()
+                webView.visibility = View.VISIBLE
+                recreate()
             }
 
             onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -44,6 +51,17 @@ class MainActivity : AppCompatActivity() {
 
             setupWebView()
 
+            val saved = readCrash(this)
+            if (saved != null) {
+                errorText.text = "Лог последнего сбоя:\n\n$saved"
+                errorText.visibility = View.VISIBLE
+                btnRefresh.visibility = View.VISIBLE
+                progressBar.visibility = View.GONE
+                webView.visibility = View.GONE
+                deleteCrash(this)
+                return
+            }
+
             if (savedInstanceState != null) {
                 webView.restoreState(savedInstanceState)
                 webviewReady = true
@@ -51,8 +69,56 @@ class MainActivity : AppCompatActivity() {
                 webView.loadUrl("https://alice.yandex.ru")
             }
         } catch (e: Throwable) {
+            saveCrashText(this, e)
             showCrash(e)
         }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        if (webviewReady) webView.saveState(outState)
+        super.onSaveInstanceState(outState)
+    }
+
+    private fun installCrashCatcher() {
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+            saveCrashText(this@MainActivity, error)
+            previous?.uncaughtException(thread, error)
+        }
+    }
+
+    private fun saveCrashText(ctx: Context, e: Throwable) {
+        val text = buildString {
+            append(e.javaClass.name)
+            append(": ")
+            append(e.message ?: "(нет сообщения)")
+            append("\n")
+            e.stackTrace.take(12).forEach { append(it.toString()); append("\n") }
+            var cause = e.cause
+            while (cause != null) {
+                append("Caused by: ")
+                append(cause.javaClass.name)
+                append(": ")
+                append(cause.message ?: "(нет сообщения)")
+                append("\n")
+                cause = cause.cause
+            }
+        }
+        try {
+            ctx.openFileOutput(CRASH_FILE, Context.MODE_PRIVATE).use {
+                it.write(text.toByteArray(Charsets.UTF_8))
+            }
+        } catch (_: Throwable) { }
+    }
+
+    private fun readCrash(ctx: Context): String? = try {
+        ctx.openFileInput(CRASH_FILE).bufferedReader().use { it.readText() }
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun deleteCrash(ctx: Context) {
+        try { ctx.deleteFile(CRASH_FILE) } catch (_: Throwable) { }
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -108,7 +174,6 @@ class MainActivity : AppCompatActivity() {
             "Иногда страницы любят, чтобы их подождали. Нажмите «Обновить» — проявим немного терпения.",
             "Всё под контролем: просто сеть решила устроить тихий час. Обновим, когда будет готова.",
             "Связь сегодня не в настроении. Обновите — посмотрим, стало ли лучше."
-            "Сегодня Котэ на смене, изнивите, сейчас выпнем и оправим нового мастера, попробуйте обновить."
         )
         runOnUiThread {
             try {

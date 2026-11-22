@@ -1,8 +1,12 @@
 package ru.turuhansk.alice.lite
 
 import android.annotation.SuppressLint
+import android.content.ContentValues
 import android.content.Context
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.View
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -13,11 +17,16 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val CRASH_FILE = "crash_log.txt"
+        private const val FILE_PREFIX = "AliceLite_crash_"
     }
 
     private lateinit var webView: WebView
@@ -53,7 +62,7 @@ class MainActivity : AppCompatActivity() {
 
             val saved = readCrash(this)
             if (saved != null) {
-                errorText.text = "Лог последнего сбоя:\n\n$saved"
+                errorText.text = "Лог последнего сбоя (копия также в папке «Загрузки»):\n\n$saved"
                 errorText.visibility = View.VISIBLE
                 btnRefresh.visibility = View.VISIBLE
                 progressBar.visibility = View.GONE
@@ -69,7 +78,7 @@ class MainActivity : AppCompatActivity() {
                 webView.loadUrl("https://alice.yandex.ru")
             }
         } catch (e: Throwable) {
-            saveCrashText(this, e)
+            saveCrash(this, e)
             showCrash(e)
         }
     }
@@ -82,28 +91,70 @@ class MainActivity : AppCompatActivity() {
     private fun installCrashCatcher() {
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-            saveCrashText(this@MainActivity, error)
+            saveCrash(this@MainActivity, error)
             previous?.uncaughtException(thread, error)
         }
     }
 
-    private fun saveCrashText(ctx: Context, e: Throwable) {
-        val text = buildString {
-            append(e.javaClass.name)
+    private fun buildCrashText(e: Throwable): String = buildString {
+        append("Сбой в приложении Алиса Lite\n")
+        append("Время: ")
+        append(SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()).format(Date()))
+        append("\nAndroid: ")
+        append(Build.VERSION.RELEASE)
+        append(" (API ")
+        append(Build.VERSION.SDK_INT)
+        append(")\nМодель: ")
+        append(Build.MANUFACTURER).append(" ").append(Build.MODEL)
+        append("\n\n")
+        append(e.javaClass.name)
+        append(": ")
+        append(e.message ?: "(нет сообщения)")
+        append("\n")
+        e.stackTrace.take(12).forEach { append(it.toString()); append("\n") }
+        var cause = e.cause
+        while (cause != null) {
+            append("\nCaused by: ")
+            append(cause.javaClass.name)
             append(": ")
-            append(e.message ?: "(нет сообщения)")
+            append(cause.message ?: "(нет сообщения)")
             append("\n")
-            e.stackTrace.take(12).forEach { append(it.toString()); append("\n") }
-            var cause = e.cause
-            while (cause != null) {
-                append("Caused by: ")
-                append(cause.javaClass.name)
-                append(": ")
-                append(cause.message ?: "(нет сообщения)")
-                append("\n")
-                cause = cause.cause
-            }
+            cause.stackTrace.take(6).forEach { append("    ").append(it.toString()).append("\n") }
+            cause = cause.cause
         }
+    }
+
+    private fun saveCrash(ctx: Context, e: Throwable) {
+        val text = buildCrashText(e)
+        val stamp = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+
+        // Копия в общую папку «Загрузки»
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.Downloads.DISPLAY_NAME, FILE_PREFIX + stamp + ".txt")
+                    put(MediaStore.Downloads.MIME_TYPE, "text/plain")
+                    put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri = ctx.contentResolver.insert(
+                    MediaStore.Downloads.EXTERNAL_CONTENT_URI, values
+                )
+                if (uri != null) {
+                    ctx.contentResolver.openOutputStream(uri)?.use {
+                        it.write(text.toByteArray(Charsets.UTF_8))
+                    }
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS
+                )
+                dir.mkdirs()
+                File(dir, FILE_PREFIX + stamp + ".txt").writeText(text)
+            }
+        } catch (_: Throwable) { }
+
+        // Копия внутри приложения — для показа на экране при следующем запуске
         try {
             ctx.openFileOutput(CRASH_FILE, Context.MODE_PRIVATE).use {
                 it.write(text.toByteArray(Charsets.UTF_8))
@@ -185,15 +236,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showCrash(e: Throwable) {
-        val text = buildString {
-            append("Ошибка запуска:\n")
-            append(e.javaClass.simpleName).append(": ").append(e.message ?: "(нет сообщения)")
-            e.stackTrace.take(6).forEach { append("\n").append(it.toString()) }
-            e.cause?.let {
-                append("\n\nПричина: ").append(it.javaClass.simpleName)
-                append(": ").append(it.message ?: "(нет сообщения)")
-            }
-        }
+        val text = buildCrashText(e)
         try {
             errorText.text = text
             errorText.visibility = View.VISIBLE

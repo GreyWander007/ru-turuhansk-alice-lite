@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
@@ -13,11 +14,13 @@ import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
+import android.os.Message
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -45,6 +48,9 @@ class MainActivity : Activity() {
         private val BTN_BG = Color.parseColor("#2E2E3A")
 
         private const val WATCHDOG_SECONDS = 60L
+
+        private const val REQUEST_FILE = 1001
+        private const val REQUEST_STORAGE = 1002
     }
 
     private lateinit var webView: WebView
@@ -52,6 +58,13 @@ class MainActivity : Activity() {
     private lateinit var errorView: LinearLayout
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
+    private lateinit var toggleBtn: TextView
+
+    private var hidingEnabled = true
+
+    // Для выбора файлов
+    private var filePathCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingFileParams: WebChromeClient.FileChooserParams? = null
 
     private val logLines = ArrayList<String>()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
@@ -59,19 +72,17 @@ class MainActivity : Activity() {
     private var isLoading = false
     private var domDumped = false
 
-    // Что прячем, чтобы остался только чат. Список правится — после дампа DOM уточним.
+    // Скрываем только мусор: промо, баннеры, QR, призывы скачать приложение, плашки куки.
+    // Шапку, навигацию и сайдбар НЕ трогаем — там кнопка входа и история чатов.
     private val hideSelectors = listOf(
-        "header", "nav", "footer",
-        "[class*='Header']", "[class*='header']",
-        "[class*='Nav']", "[class*='nav']",
-        "[class*='Sidebar']", "[class*='sidebar']",
-        "[class*='Footer']", "[class*='footer']",
         "[class*='Promo']", "[class*='promo']",
         "[class*='Banner']", "[class*='banner']",
+        "[class*='Qr']", "[class*='qr']",
         "[class*='Download']", "[class*='download']",
         "[class*='Install']", "[class*='install']",
-        "[class*='Qr']", "[class*='qr']",
-        "[class*='Cookie']", "[class*='cookie']"
+        "[class*='Cookie']", "[class*='cookie']",
+        "[class*='Marketing']", "[class*='marketing']",
+        "[class*='Adv']", "[class*='adv']"
     )
 
     // Сторожевой таймер: если за 60 секунд страница не отрисовалась — показываем ошибку
@@ -131,6 +142,9 @@ class MainActivity : Activity() {
         errorView.visibility = android.view.View.GONE
         root.addView(errorView)
 
+        toggleBtn = makeToggleButton()
+        root.addView(toggleBtn)
+
         loadingView.visibility = android.view.View.VISIBLE
 
         setContentView(root)
@@ -138,7 +152,7 @@ class MainActivity : Activity() {
         webView.loadUrl("https://alice.yandex.ru")
     }
 
-       private fun logWebViewVersion() {
+    private fun logWebViewVersion() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val pkg = WebView.getCurrentWebViewPackage()
@@ -157,6 +171,8 @@ class MainActivity : Activity() {
             databaseEnabled = true
             loadWithOverviewMode = true
             useWideViewPort = true
+            javaScriptCanOpenWindowsAutomatically = true
+            allowFileAccess = true
             cacheMode = WebSettings.LOAD_DEFAULT
             userAgentString = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
         }
@@ -164,6 +180,35 @@ class MainActivity : Activity() {
 
         wv.webViewClient = AliceWebViewClient()
         wv.webChromeClient = object : WebChromeClient() {
+
+            // Всплывающие окна (шаги авторизации, формы) грузим в тот же WebView
+            override fun onCreateWindow(
+                view: WebView?,
+                isDialog: Boolean,
+                isUserGesture: Boolean,
+                resultMsg: Message?
+            ): Boolean {
+                if (view == null || resultMsg == null) return false
+                log("js", "создание окна: isDialog=$isDialog")
+                val transport = resultMsg.obj as WebView.WebViewTransport
+                transport.webView = view
+                resultMsg.sendToTarget()
+                return true
+            }
+
+            // Диалог выбора файлов: без него крестик «прикрепить файл» мёртв
+            override fun onShowFileChooser(
+                webView: WebView?,
+                callback: ValueCallback<Array<Uri>>,
+                params: FileChooserParams
+            ): Boolean {
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = callback
+                log("app", "запрошен выбор файла, режим=${params.mode}")
+                openFilePicker(params)
+                return true
+            }
+
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 super.onProgressChanged(view, newProgress)
                 log("net", "прогресс: $newProgress%")
@@ -182,39 +227,120 @@ class MainActivity : Activity() {
         }
     }
 
-    // --- Инъекция: прячем всё, кроме чата ---
+    // --- Выбор файлов ---
+
+    private fun storagePermissions(): Array<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(
+                android.Manifest.permission.READ_MEDIA_IMAGES,
+                android.Manifest.permission.READ_MEDIA_VIDEO,
+                android.Manifest.permission.READ_MEDIA_AUDIO
+            )
+        } else {
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+    }
+
+    private fun hasStoragePermission(): Boolean {
+        // На Android 10+ системный выбор файлов не требует разрешения — доступ выдаётся
+        // самим пикером только к выбранному файлу
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) return true
+        return checkSelfPermission(android.Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun openFilePicker(params: WebChromeClient.FileChooserParams) {
+        if (hasStoragePermission()) {
+            launchPicker(params)
+        } else {
+            pendingFileParams = params
+            log("app", "запрашиваем разрешение на хранилище")
+            requestPermissions(storagePermissions(), REQUEST_STORAGE)
+        }
+    }
+
+    private fun launchPicker(params: WebChromeClient.FileChooserParams) {
+        try {
+            startActivityForResult(params.createIntent(), REQUEST_FILE)
+        } catch (e: Exception) {
+            log("err", "не удалось открыть выбор файла: $e")
+            filePathCallback?.onReceiveValue(null)
+            filePathCallback = null
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQUEST_FILE) {
+            val callback = filePathCallback
+            filePathCallback = null
+            val result = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
+            if (result != null && result.isNotEmpty()) {
+                log("app", "файл выбран: ${result.joinToString { it.lastPathSegment ?: "?" }}")
+            } else {
+                log("app", "выбор файла отменён")
+            }
+            callback?.onReceiveValue(result ?: arrayOf())
+        } else {
+            super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        if (requestCode == REQUEST_STORAGE) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                pendingFileParams?.let { launchPicker(it) }
+            } else {
+                log("err", "разрешение на хранилище не выдано")
+                filePathCallback?.onReceiveValue(null)
+                filePathCallback = null
+            }
+            pendingFileParams = null
+        } else {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        }
+    }
+
+    // --- Инъекция: стиль прячется/показывается классом на body, поэтому переключаемо ---
 
     private fun injectChatOnly(wv: WebView) {
         val selJson = hideSelectors.joinToString(",") { "\"$it\"" }
+        val enabled = if (hidingEnabled) "true" else "false"
         val script = """
 (function(){
-var sels=[$selJson];
-function hideAll(){
-  for(var i=0;i<sels.length;i++){
-    try{
-      var list=document.querySelectorAll(sels[i]);
-      for(var j=0;j<list.length;j++){
-        list[j].style.setProperty('display','none','important');
-      }
-    }catch(e){}
-  }
+window.__hideUi = $enabled;
+if(!window.__aliceCssOn){
+  window.__aliceCssOn = true;
+  var st=document.createElement('style');
+  st.id='__aliceCss';
+  st.textContent='body.__aliceHideUi ' + [[$selJson].join(',')].join(',') + ' {display:none!important}';
+  (document.head||document.documentElement).appendChild(st);
+  var mo=new MutationObserver(function(){
+    if(!document.getElementById('__aliceCss')){
+      var s2=document.createElement('style');
+      s2.id='__aliceCss';
+      s2.textContent='body.__aliceHideUi ' + [[$selJson].join(',')].join(',') + ' {display:none!important}';
+      (document.head||document.documentElement).appendChild(s2);
+    }
+    if(document.body && window.__hideUi===true && !document.body.classList.contains('__aliceHideUi')){
+      document.body.classList.add('__aliceHideUi');
+    }
+  });
+  mo.observe(document.documentElement,{childList:true,subtree:true});
 }
-hideAll();
-if(window.__aliceHideOn){return;}
-window.__aliceHideOn=true;
-var t=null;
-var mo=new MutationObserver(function(){
-  if(t){clearTimeout(t);}
-  t=setTimeout(hideAll,50);
-});
-mo.observe(document.documentElement,{childList:true,subtree:true});
+if(document.body){
+  if(window.__hideUi===true){ document.body.classList.add('__aliceHideUi'); }
+  else { document.body.classList.remove('__aliceHideUi'); }
+}
 })();
 """.trimIndent()
 
-        wv.evaluateJavascript(script) { r -> log("inject", "скрытие применено: ${r ?: "ok"}") }
+        wv.evaluateJavascript(script) { _ -> log("inject", "инъекция применена (hide=$enabled)") }
     }
 
-    // Разовый дамп верхнего уровня страницы — чтобы подобрать точные селекторы
+    // Разовый дамп верхнего уровня страницы — для подбора точных селекторов
     private fun dumpDom(wv: WebView) {
         if (domDumped) return
         domDumped = true
@@ -315,6 +441,27 @@ return out.join(' | ');
         box.addView(btn)
         box.addView(browserBtn)
         return box
+    }
+
+    private fun makeToggleButton(): TextView {
+        return TextView(this).apply {
+            text = "режим: только чат"
+            textSize = 12f
+            setTextColor(TEXT_MUTED)
+            setBackgroundColor(Color.parseColor("#802E2E3A"))
+            setPadding(24, 12, 24, 12)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP or Gravity.END
+            ).apply { setMargins(0, 16, 16, 0) }
+            setOnClickListener {
+                hidingEnabled = !hidingEnabled
+                text = if (hidingEnabled) "режим: только чат" else "режим: показать всё"
+                log("app", "переключатель: hide=$hidingEnabled")
+                injectChatOnly(webView)
+            }
+        }
     }
 
     private fun randomFunny(): String = funnyErrors[Random.nextInt(funnyErrors.size)]

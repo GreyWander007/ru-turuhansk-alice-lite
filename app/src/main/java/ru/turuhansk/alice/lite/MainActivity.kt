@@ -138,11 +138,11 @@ class MainActivity : Activity() {
         webView.loadUrl("https://alice.yandex.ru")
     }
 
-    private fun logWebViewVersion() {
+       private fun logWebViewVersion() {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 val pkg = WebView.getCurrentWebViewPackage()
-                log("app", "WebView: ${pkg?.name ?: "?"} ${pkg?.versionName ?: "?"}")
+                log("app", "WebView: ${pkg?.packageName ?: "?"} ${pkg?.versionName ?: "?"}")
             }
         } catch (e: Exception) {
             log("app", "WebView: версию узнать не удалось")

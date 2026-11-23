@@ -8,7 +8,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val tv = TextView(this)
-        tv.text = "Тест: приложение живо?"
+        tv.text = "Тест: приложение живо"
         tv.textSize = 20f
         tv.setPadding(32, 64, 32, 64)
         setContentView(tv)

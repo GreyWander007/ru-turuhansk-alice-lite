@@ -68,6 +68,14 @@ class MainActivity : Activity() {
 
         // Показывать страницу можно уже с этой отметки прогресса — как в браузере
         private const val SHOW_AT_PROGRESS = 85
+
+        private const val REQUEST_FILE = 1001
+        private const val REQUEST_STORAGE = 1002
+        private const val REQUEST_NOTIFICATIONS = 1003
+
+        // Автоповтор при разовых сетевых сбоях (ERR_HTTP2_PROTOCOL_ERROR)
+        private const val MAX_HTTP_RETRIES = 1
+        private const val RETRY_DELAY_MS = 800L
     }
 
     private lateinit var prefs: SharedPreferences
@@ -83,6 +91,7 @@ class MainActivity : Activity() {
 
     private var hidingEnabled = true
     private var lastLoggedProgress = -20
+    private var httpRetries = 0
 
     // Для выбора файлов
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -117,11 +126,11 @@ class MainActivity : Activity() {
         "DNS отказался отвечать. Он тоже удивлён.",
         "Не удалось сохранить лог ошибки об ошибке.",
         "Интернет не подключён. Просто поверьте.",
-        "Это работает? 1",
+        "Это работает?",
         "Загрузка видео завершена. Скачалось: ничего.",
         "Часовой пояс не найден. Зима близко.",
         "Данных нет. Всё хорошо.",
-        "Памяти достаточно? 1",
+        "Памяти достаточно?",
         "Котэ настучал на сервер лапой. Сервер не ответил.",
         "Сервер ушёл на обед. Возвращается, когда захочет.",
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
@@ -151,6 +160,18 @@ class MainActivity : Activity() {
 
         log("app", "onCreate: запуск")
         logWebViewVersion()
+
+        // Разрешение на уведомления: без него на Android 13+ шторка молчит,
+        // хотя служба-то работает
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(
+                arrayOf(android.Manifest.permission.POST_NOTIFICATIONS),
+                REQUEST_NOTIFICATIONS
+            )
+        }
 
         // Шторка и нижняя панель — в цвет экрана, чтобы не выделялись
         window.statusBarColor = BG_DARK
@@ -219,9 +240,11 @@ class MainActivity : Activity() {
             loadWithOverviewMode = true
             useWideViewPort = true
             javaScriptCanOpenWindowsAutomatically = true
+            supportMultipleWindows = true // без этого onCreateWindow не срабатывает вовсе
             allowFileAccess = true
             cacheMode = WebSettings.LOAD_DEFAULT
-            userAgentString = "Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36"
+            // User-Agent НЕ подменяем: WebView представляется сам (Chrome 157),
+            // а сайт раздаёт бандлы под настоящую версию движка
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
 
@@ -306,13 +329,13 @@ class MainActivity : Activity() {
         } else {
             pendingFileParams = params
             log("app", "запрашиваем разрешение на хранилище")
-            requestPermissions(storagePermissions(), 1002)
+            requestPermissions(storagePermissions(), REQUEST_STORAGE)
         }
     }
 
     private fun launchPicker(params: WebChromeClient.FileChooserParams) {
         try {
-            startActivityForResult(params.createIntent(), 1001)
+            startActivityForResult(params.createIntent(), REQUEST_FILE)
         } catch (e: Exception) {
             log("err", "не удалось открыть выбор файла: $e")
             filePathCallback?.onReceiveValue(null)
@@ -321,7 +344,7 @@ class MainActivity : Activity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == 1001) {
+        if (requestCode == REQUEST_FILE) {
             val callback = filePathCallback
             filePathCallback = null
             val result = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
@@ -341,7 +364,13 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         grantResults: IntArray
     ) {
-        if (requestCode == 1002) {
+        if (requestCode == REQUEST_NOTIFICATIONS) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+                log("app", "разрешение на уведомления выдано")
+            } else {
+                log("app", "разрешение на уведомления не выдано — шторка будет молчать")
+            }
+        } else if (requestCode == REQUEST_STORAGE) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
                 pendingFileParams?.let { launchPicker(it) }
             } else {
@@ -717,6 +746,7 @@ return out.join(' | ');
             log("net", "начали грузить: $url")
             loadingProgress.progress = 0
             statusText.text = "Загрузка… 0%"
+            lastLoggedProgress = -20 // чтобы прогресс новых загрузок снова писался в лог
             showLoading(true)
             showError(false)
         }
@@ -753,8 +783,16 @@ return out.join(' | ');
             val desc = error?.description?.toString() ?: "неизвестная ошибка"
             log("err", "$desc (url=${request?.url})")
             if (request?.isForMainFrame == true) {
-                showLoading(false)
-                showError(true, desc)
+                // HTTP2-сбои часто разовые: один тихий автоповтор вместо ошибки на экране
+                val isHttp2 = desc.contains("ERR_HTTP2", ignoreCase = true)
+                if (isHttp2 && httpRetries < MAX_HTTP_RETRIES) {
+                    httpRetries++
+                    log("net", "автоповтор загрузки ($httpRetries из $MAX_HTTP_RETRIES)")
+                    view?.postDelayed({ view.reload() }, RETRY_DELAY_MS)
+                } else {
+                    showLoading(false)
+                    showError(true, desc)
+                }
             }
         }
 

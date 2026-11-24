@@ -240,7 +240,7 @@ class MainActivity : Activity() {
             loadWithOverviewMode = true
             useWideViewPort = true
             javaScriptCanOpenWindowsAutomatically = true
-            supportMultipleWindows = true // без этого onCreateWindow не срабатывает вовсе
+            setSupportMultipleWindows(true) // без этого onCreateWindow не срабатывает вовсе
             allowFileAccess = true
             cacheMode = WebSettings.LOAD_DEFAULT
             // User-Agent НЕ подменяем: WebView представляется сам (Chrome 157),

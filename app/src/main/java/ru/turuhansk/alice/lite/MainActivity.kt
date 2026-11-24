@@ -74,8 +74,8 @@ class MainActivity : Activity() {
         private const val REQUEST_NOTIFICATIONS = 1003
 
         // Автоповтор при разовых сетевых сбоях (ERR_HTTP2_PROTOCOL_ERROR)
-        private const val MAX_HTTP_RETRIES = 1
-        private const val RETRY_DELAY_MS = 800L
+        private const val MAX_HTTP_RETRIES = 2
+        private const val RETRY_DELAY_MS = 1500L
     }
 
     private lateinit var prefs: SharedPreferences
@@ -85,6 +85,7 @@ class MainActivity : Activity() {
     private lateinit var errorView: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var loadingProgress: ProgressBar
+    private lateinit var topProgress: ProgressBar
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
     private lateinit var toggleBtn: TextView
@@ -126,11 +127,11 @@ class MainActivity : Activity() {
         "DNS отказался отвечать. Он тоже удивлён.",
         "Не удалось сохранить лог ошибки об ошибке.",
         "Интернет не подключён. Просто поверьте.",
-        "Это работает?",
+        "Это работает? 1",
         "Загрузка видео завершена. Скачалось: ничего.",
         "Часовой пояс не найден. Зима близко.",
         "Данных нет. Всё хорошо.",
-        "Памяти достаточно?",
+        "Памяти достаточно? 1",
         "Котэ настучал на сервер лапой. Сервер не ответил.",
         "Сервер ушёл на обед. Возвращается, когда захочет.",
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
@@ -198,6 +199,20 @@ class MainActivity : Activity() {
 
         toggleBtn = makeToggleButton()
         root.addView(toggleBtn)
+
+        // Тонкая полоска поверх страницы: видна, пока загрузка не дошла до 100%
+        topProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            progressTintList = ColorStateList.valueOf(ACCENT)
+            progressBackgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                (resources.displayMetrics.density * 3).toInt(),
+                Gravity.TOP
+            )
+        }
+        root.addView(topProgress)
 
         loadingView.visibility = android.view.View.VISIBLE
 
@@ -284,6 +299,9 @@ class MainActivity : Activity() {
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 super.onProgressChanged(view, newProgress)
                 loadingProgress.progress = newProgress
+                topProgress.progress = newProgress
+                topProgress.visibility =
+                    if (newProgress >= 100) android.view.View.GONE else android.view.View.VISIBLE
                 statusText.text = "Загрузка… $newProgress%"
                 if (newProgress - lastLoggedProgress >= 20 || newProgress >= 100) {
                     lastLoggedProgress = newProgress
@@ -444,6 +462,23 @@ return out.join(' | ');
             val short = if (s.length > 1500) s.substring(0, 1500) + "…" else s
             log("dom", "структура: $short")
         }
+    }
+
+    // Проба живости: загрузился ли бандл React и смонтировалось ли приложение
+    private fun jsProbe(wv: WebView, reason: String) {
+        val script = """
+(function(){
+  var page=document.querySelector('div[id^="AlicePage"]');
+  return JSON.stringify({
+    pageFound: !!page,
+    pageChildren: page?page.childElementCount:0,
+    readyState: document.readyState,
+    bodyLen: document.body?document.body.innerHTML.length:0
+  });
+})();
+""".trimIndent()
+
+        wv.evaluateJavascript(script) { r -> log("probe", "$reason: $r") }
     }
 
     // --- Оформление ---
@@ -745,6 +780,8 @@ return out.join(' | ');
             super.onPageStarted(view, url, favicon)
             log("net", "начали грузить: $url")
             loadingProgress.progress = 0
+            topProgress.progress = 0
+            topProgress.visibility = android.view.View.VISIBLE
             statusText.text = "Загрузка… 0%"
             lastLoggedProgress = -20 // чтобы прогресс новых загрузок снова писался в лог
             showLoading(true)
@@ -766,6 +803,8 @@ return out.join(' | ');
             view?.let {
                 injectChatOnly(it)
                 dumpDom(it)
+                jsProbe(it, "по завершении")
+                it.postDelayed({ if (!isFinishing) jsProbe(it, "через 10с") }, 10000)
             }
         }
 
@@ -783,7 +822,7 @@ return out.join(' | ');
             val desc = error?.description?.toString() ?: "неизвестная ошибка"
             log("err", "$desc (url=${request?.url})")
             if (request?.isForMainFrame == true) {
-                // HTTP2-сбои часто разовые: один тихий автоповтор вместо ошибки на экране
+                // HTTP2-сбои часто разовые: тихий автоповтор вместо ошибки на экране
                 val isHttp2 = desc.contains("ERR_HTTP2", ignoreCase = true)
                 if (isHttp2 && httpRetries < MAX_HTTP_RETRIES) {
                     httpRetries++

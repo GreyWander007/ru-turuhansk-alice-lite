@@ -131,6 +131,21 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Перехватчик падений: выгружает лог на диск даже при креше.
+        // Без него буфер в памяти умирает вместе с процессом и лог теряется
+        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            val sw = java.io.StringWriter()
+            e.printStackTrace(java.io.PrintWriter(sw))
+            val content = logLines.joinToString("\n") + "\n[crash] " + sw
+            try {
+                getExternalFilesDir(null)?.let { dir ->
+                    File(dir, "alice_log.txt").writeText(content)
+                }
+            } catch (_: Exception) { /* уже всё плохо, не усугубляем */ }
+            defaultHandler?.uncaughtException(Thread.currentThread(), e)
+        }
+
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
         hidingEnabled = prefs.getBoolean(KEY_HIDING, true)
 
@@ -411,10 +426,11 @@ return out.join(' | ');
         }
     }
 
-    // Обновление вида пилюли в зависимости от режима
-    private fun refreshPillLook() {
-        toggleBtn.background = GlowPillDrawable(hidingEnabled)
-        toggleBtn.setTextColor(if (hidingEnabled) GREEN_BRIGHT else TEXT_MUTED)
+    // Обновление вида пилюли в зависимости от режима.
+    // btn передаётся явно: при первом создании toggleBtn ещё не присвоен
+    private fun refreshPillLook(btn: TextView) {
+        btn.background = GlowPillDrawable(hidingEnabled)
+        btn.setTextColor(if (hidingEnabled) GREEN_BRIGHT else TEXT_MUTED)
     }
 
     private fun makeLoadingView(): LinearLayout {
@@ -526,7 +542,7 @@ return out.join(' | ');
             text = if (hidingEnabled) "только чат" else "показать всё"
             textSize = 12f
             setPadding(34, 16, 34, 16)
-            refreshPillLook() // фон и цвет текста по текущему состоянию
+            refreshPillLook(this) // фон и цвет текста по текущему состоянию
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -568,7 +584,7 @@ return out.join(' | ');
                             hidingEnabled = !hidingEnabled
                             prefs.edit().putBoolean(KEY_HIDING, hidingEnabled).apply()
                             text = if (hidingEnabled) "только чат" else "показать всё"
-                            refreshPillLook()
+                            refreshPillLook(toggleBtn)
                             log("app", "переключатель: hide=$hidingEnabled")
                             injectChatOnly(webView)
                         }

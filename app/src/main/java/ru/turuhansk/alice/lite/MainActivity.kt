@@ -141,18 +141,14 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Перехватчик падений: выгружает лог на диск даже при креше.
-        // Без него буфер в памяти умирает вместе с процессом и лог теряется
+        // Перехватчик падений: лог выгружается в тот же файл через единый канал,
+        // чтобы не плодить копии в разных папках
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { _, e ->
             val sw = java.io.StringWriter()
             e.printStackTrace(java.io.PrintWriter(sw))
-            val content = logLines.joinToString("\n") + "\n[crash] " + sw
-            try {
-                getExternalFilesDir(null)?.let { dir ->
-                    File(dir, "alice_log.txt").writeText(content)
-                }
-            } catch (_: Exception) { /* уже всё плохо, не усугубляем */ }
+            logLines.add("[crash] " + sw.toString())
+            saveLogToDownloads()
             defaultHandler?.uncaughtException(Thread.currentThread(), e)
         }
 
@@ -200,7 +196,8 @@ class MainActivity : Activity() {
         toggleBtn = makeToggleButton()
         root.addView(toggleBtn)
 
-        // Тонкая полоска поверх страницы: видна, пока загрузка не дошла до 100%
+        // Тонкая полоска поверх страницы: видна, пока загрузка не завершилась
+        // окончательно (прячется только в onPageFinished, не по процентам)
         topProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             progress = 0
@@ -295,13 +292,12 @@ class MainActivity : Activity() {
             }
 
             // Живой прогресс: проценты в тексте и полоска обновляются в реальном времени.
-            // Страницу показываем рано (с SHOW_AT_PROGRESS%), как в браузере
+            // Полоску сверху прячет только onPageFinished — WebView присылает 100%
+            // и при провале загрузки, поэтому процентам верить нельзя
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 super.onProgressChanged(view, newProgress)
                 loadingProgress.progress = newProgress
                 topProgress.progress = newProgress
-                topProgress.visibility =
-                    if (newProgress >= 100) android.view.View.GONE else android.view.View.VISIBLE
                 statusText.text = "Загрузка… $newProgress%"
                 if (newProgress - lastLoggedProgress >= 20 || newProgress >= 100) {
                     lastLoggedProgress = newProgress
@@ -799,6 +795,9 @@ return out.join(' | ');
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
             log("net", "страница загружена: $url, заголовок: «${view?.title ?: ""}»")
+            // Полоска сверху убирается только здесь — по факту полной загрузки
+            topProgress.progress = 100
+            topProgress.visibility = android.view.View.GONE
             revealPage()
             view?.let {
                 injectChatOnly(it)

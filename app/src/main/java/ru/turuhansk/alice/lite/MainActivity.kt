@@ -5,18 +5,23 @@ import android.app.Activity
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
-import android.os.Handler
-import android.os.Looper
 import android.os.Message
 import android.provider.MediaStore
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
@@ -31,11 +36,13 @@ import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.TextView
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.random.Random
 
 class MainActivity : Activity() {
@@ -46,21 +53,36 @@ class MainActivity : Activity() {
         private val TEXT_MAIN = Color.parseColor("#E8E8EC")
         private val TEXT_MUTED = Color.parseColor("#9A9AA6")
         private val BTN_BG = Color.parseColor("#2E2E3A")
+        private val ACCENT = Color.parseColor("#7B61FF")
 
-        private const val WATCHDOG_SECONDS = 60L
+        // Зелёная подсветка активного режима
+        private val GREEN_BRIGHT = Color.parseColor("#FF4CAF50")
 
-        private const val REQUEST_FILE = 1001
-        private const val REQUEST_STORAGE = 1002
+        private const val PREFS_NAME = "alice_lite_prefs"
+        private const val KEY_PILL_X = "pill_x"
+        private const val KEY_PILL_Y = "pill_y"
+        private const val KEY_HIDING = "hiding_enabled"
+        private const val KEY_LAST_URL = "last_url"
+
+        private const val DEFAULT_URL = "https://alice.yandex.ru"
+
+        // Показывать страницу можно уже с этой отметки прогресса — как в браузере
+        private const val SHOW_AT_PROGRESS = 85
     }
+
+    private lateinit var prefs: SharedPreferences
 
     private lateinit var webView: WebView
     private lateinit var loadingView: LinearLayout
     private lateinit var errorView: LinearLayout
+    private lateinit var statusText: TextView
+    private lateinit var loadingProgress: ProgressBar
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
     private lateinit var toggleBtn: TextView
 
     private var hidingEnabled = true
+    private var lastLoggedProgress = -20
 
     // Для выбора файлов
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -68,8 +90,6 @@ class MainActivity : Activity() {
 
     private val logLines = ArrayList<String>()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
-    private val handler = Handler(Looper.getMainLooper())
-    private var isLoading = false
     private var domDumped = false
 
     // Скрываем только мусор: промо, баннеры, QR, призывы скачать приложение, плашки куки.
@@ -84,15 +104,6 @@ class MainActivity : Activity() {
         "[class*='Marketing']", "[class*='marketing']",
         "[class*='Adv']", "[class*='adv']"
     )
-
-    // Сторожевой таймер: если за 60 секунд страница не отрисовалась — показываем ошибку
-    private val watchdog = Runnable {
-        if (isLoading) {
-            log("err", "таймаут: страница не отрисовалась за $WATCHDOG_SECONDS секунд")
-            showLoading(false)
-            showError(true, "страница не ответила за $WATCHDOG_SECONDS секунд — скрипты сайта не стартовали (возможно, старый WebView)")
-        }
-    }
 
     private val funnyErrors = listOf(
         "Сегодня на смене Котэ. Мы извиняемся, что выпустили тормоза — сейчас заменим, а вы пока обновите 🐱",
@@ -120,8 +131,15 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+        hidingEnabled = prefs.getBoolean(KEY_HIDING, true)
+
         log("app", "onCreate: запуск")
         logWebViewVersion()
+
+        // Шторка и нижняя панель — в цвет экрана, чтобы не выделялись
+        window.statusBarColor = BG_DARK
+        window.navigationBarColor = BG_DARK
 
         val root = FrameLayout(this).apply { setBackgroundColor(BG_DARK) }
 
@@ -149,7 +167,21 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
-        webView.loadUrl("https://alice.yandex.ru")
+        // Восстановление сессии: если система пересоздала активити — возвращаем
+        // состояние WebView (включая историю переходов и открытый чат)
+        if (savedInstanceState != null && webView.restoreState(savedInstanceState) != null) {
+            log("app", "состояние WebView восстановлено")
+        } else {
+            val lastUrl = prefs.getString(KEY_LAST_URL, null) ?: DEFAULT_URL
+            log("app", "открываем сохранённую страницу: $lastUrl")
+            webView.loadUrl(lastUrl)
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        // Сохраняем состояние WebView: историю, позиции прокрутки — чат продолжится
+        webView.saveState(outState)
     }
 
     private fun logWebViewVersion() {
@@ -163,7 +195,7 @@ class MainActivity : Activity() {
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled")
+    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     private fun setupWebView(wv: WebView) {
         wv.settings.apply {
             javaScriptEnabled = true
@@ -198,7 +230,7 @@ class MainActivity : Activity() {
 
             // Диалог выбора файлов: без него крестик «прикрепить файл» мёртв
             override fun onShowFileChooser(
-                webView: WebView?,
+                wv2: WebView?,
                 callback: ValueCallback<Array<Uri>>,
                 params: FileChooserParams
             ): Boolean {
@@ -209,14 +241,19 @@ class MainActivity : Activity() {
                 return true
             }
 
+            // Живой прогресс: проценты в тексте и полоска обновляются в реальном времени.
+            // Страницу показываем рано (с SHOW_AT_PROGRESS%), как в браузере
             override fun onProgressChanged(view: WebView?, newProgress: Int) {
                 super.onProgressChanged(view, newProgress)
-                log("net", "прогресс: $newProgress%")
-                if (newProgress >= 100) {
-                    isLoading = false
-                    handler.removeCallbacks(watchdog)
-                    showLoading(false)
-                    view?.let { injectChatOnly(it) }
+                loadingProgress.progress = newProgress
+                statusText.text = "Загрузка… $newProgress%"
+                if (newProgress - lastLoggedProgress >= 20 || newProgress >= 100) {
+                    lastLoggedProgress = newProgress
+                    log("net", "прогресс: $newProgress%")
+                }
+                if (newProgress >= SHOW_AT_PROGRESS) {
+                    revealPage()
+                    if (newProgress >= 100) view?.let { injectChatOnly(it) }
                 }
             }
 
@@ -254,13 +291,13 @@ class MainActivity : Activity() {
         } else {
             pendingFileParams = params
             log("app", "запрашиваем разрешение на хранилище")
-            requestPermissions(storagePermissions(), REQUEST_STORAGE)
+            requestPermissions(storagePermissions(), 1002)
         }
     }
 
     private fun launchPicker(params: WebChromeClient.FileChooserParams) {
         try {
-            startActivityForResult(params.createIntent(), REQUEST_FILE)
+            startActivityForResult(params.createIntent(), 1001)
         } catch (e: Exception) {
             log("err", "не удалось открыть выбор файла: $e")
             filePathCallback?.onReceiveValue(null)
@@ -269,7 +306,7 @@ class MainActivity : Activity() {
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        if (requestCode == REQUEST_FILE) {
+        if (requestCode == 1001) {
             val callback = filePathCallback
             filePathCallback = null
             val result = WebChromeClient.FileChooserParams.parseResult(resultCode, data)
@@ -289,7 +326,7 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         grantResults: IntArray
     ) {
-        if (requestCode == REQUEST_STORAGE) {
+        if (requestCode == 1002) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
                 pendingFileParams?.let { launchPicker(it) }
             } else {
@@ -365,7 +402,20 @@ return out.join(' | ');
         }
     }
 
-    // --- Экраны ---
+    // --- Оформление ---
+
+    private fun pillDrawable(color: Int, radius: Float): GradientDrawable {
+        return GradientDrawable().apply {
+            setColor(color)
+            cornerRadius = radius
+        }
+    }
+
+    // Обновление вида пилюли в зависимости от режима
+    private fun refreshPillLook() {
+        toggleBtn.background = GlowPillDrawable(hidingEnabled)
+        toggleBtn.setTextColor(if (hidingEnabled) GREEN_BRIGHT else TEXT_MUTED)
+    }
 
     private fun makeLoadingView(): LinearLayout {
         val box = LinearLayout(this).apply {
@@ -377,14 +427,37 @@ return out.join(' | ');
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-        val tv = TextView(this).apply {
-            text = "Загрузка…\nсоединяемся с сервером"
+
+        statusText = TextView(this).apply {
+            text = "Загрузка… 0%"
             textSize = 18f
             gravity = Gravity.CENTER
             setTextColor(TEXT_MAIN)
-            setPadding(48, 0, 48, 0)
+            setPadding(48, 0, 48, 24)
         }
-        box.addView(tv)
+
+        loadingProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            progressTintList = ColorStateList.valueOf(ACCENT)
+            progressBackgroundTintList = ColorStateList.valueOf(BTN_BG)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(64, 0, 64, 36) }
+        }
+
+        val reload = Button(this).apply {
+            text = "Обновить"
+            setTextColor(TEXT_MAIN)
+            background = pillDrawable(BTN_BG, 28f)
+            setPadding(64, 28, 64, 28)
+            setOnClickListener { reloadPage() }
+        }
+
+        box.addView(statusText)
+        box.addView(loadingProgress)
+        box.addView(reload)
         return box
     }
 
@@ -416,24 +489,26 @@ return out.join(' | ');
 
         val btn = Button(this).apply {
             text = "Повторить"
-            setOnClickListener { retry() }
             setTextColor(TEXT_MAIN)
-            setBackgroundColor(BTN_BG)
+            background = pillDrawable(BTN_BG, 28f)
+            setPadding(64, 28, 64, 28)
+            setOnClickListener { reloadPage() }
         }
 
         val browserBtn = Button(this).apply {
             text = "Открыть в браузере"
+            setTextColor(TEXT_MUTED)
+            background = pillDrawable(BTN_BG, 28f)
+            setPadding(48, 24, 48, 24)
             setOnClickListener {
                 try {
                     startActivity(
-                        Intent(Intent.ACTION_VIEW, Uri.parse("https://alice.yandex.ru"))
+                        Intent(Intent.ACTION_VIEW, Uri.parse(DEFAULT_URL))
                     )
                 } catch (e: Exception) {
                     log("err", "браузер не найден: $e")
                 }
             }
-            setTextColor(TEXT_MUTED)
-            setBackgroundColor(BTN_BG)
         }
 
         box.addView(funnyText)
@@ -443,38 +518,86 @@ return out.join(' | ');
         return box
     }
 
+    // Переключатель: пилюля с перетаскиванием, позиция запоминается между запусками,
+    // разлитый зелёный ореол в активном режиме, без него — в пассивном
+    @SuppressLint("ClickableViewAccessibility")
     private fun makeToggleButton(): TextView {
         return TextView(this).apply {
-            text = "режим: только чат"
+            text = if (hidingEnabled) "только чат" else "показать всё"
             textSize = 12f
-            setTextColor(TEXT_MUTED)
-            setBackgroundColor(Color.parseColor("#802E2E3A"))
-            setPadding(24, 12, 24, 12)
+            setPadding(34, 16, 34, 16)
+            refreshPillLook() // фон и цвет текста по текущему состоянию
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.END
-            ).apply { setMargins(0, 16, 16, 0) }
-            setOnClickListener {
-                hidingEnabled = !hidingEnabled
-                text = if (hidingEnabled) "режим: только чат" else "режим: показать всё"
-                log("app", "переключатель: hide=$hidingEnabled")
-                injectChatOnly(webView)
+                Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            ).apply { setMargins(0, 24, 0, 0) }
+
+            // Возвращаем сохранённую позицию
+            translationX = prefs.getFloat(KEY_PILL_X, 0f)
+            translationY = prefs.getFloat(KEY_PILL_Y, 0f)
+
+            var downX = 0f
+            var downY = 0f
+            var moved = false
+
+            setOnTouchListener { v, e ->
+                when (e.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        downX = e.rawX; downY = e.rawY; moved = false; true
+                    }
+                    MotionEvent.ACTION_MOVE -> {
+                        val dx = e.rawX - downX
+                        val dy = e.rawY - downY
+                        if (abs(dx) > 8 || abs(dy) > 8) {
+                            moved = true
+                            v.translationX += dx
+                            v.translationY += dy
+                            downX = e.rawX; downY = e.rawY
+                        }
+                        true
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (moved) {
+                            // Запоминаем позицию
+                            prefs.edit()
+                                .putFloat(KEY_PILL_X, v.translationX)
+                                .putFloat(KEY_PILL_Y, v.translationY)
+                                .apply()
+                        } else {
+                            hidingEnabled = !hidingEnabled
+                            prefs.edit().putBoolean(KEY_HIDING, hidingEnabled).apply()
+                            text = if (hidingEnabled) "только чат" else "показать всё"
+                            refreshPillLook()
+                            log("app", "переключатель: hide=$hidingEnabled")
+                            injectChatOnly(webView)
+                        }
+                        true
+                    }
+                    else -> false
+                }
             }
         }
     }
 
-    private fun randomFunny(): String = funnyErrors[Random.nextInt(funnyErrors.size)]
+    // --- Действия ---
 
-    private fun retry() {
+    private fun reloadPage() {
         showError(false)
+        loadingProgress.progress = 0
+        statusText.text = "Загрузка… 0%"
         showLoading(true)
-        isLoading = true
-        webView.loadUrl("https://alice.yandex.ru")
+        webView.reload()
     }
+
+    private fun randomFunny(): String = funnyErrors[Random.nextInt(funnyErrors.size)]
 
     private fun showLoading(visible: Boolean) {
         loadingView.visibility = if (visible) android.view.View.VISIBLE else android.view.View.GONE
+    }
+
+    private fun revealPage() {
+        showLoading(false)
     }
 
     private fun showError(visible: Boolean, message: String = "") {
@@ -497,27 +620,45 @@ return out.join(' | ');
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        // Вернулись в приложение — служба больше не нужна, чат продолжается на экране
+        stopService(Intent(this, KeepAliveService::class.java))
+    }
+
     override fun onPause() {
         super.onPause()
+        // Пока приложение свернуто, служба держит процесс живым — чат не умирает
+        startKeepAliveService()
+        // Запоминаем последнюю открытую страницу
+        val url = webView.url
+        if (!url.isNullOrEmpty()) {
+            prefs.edit().putString(KEY_LAST_URL, url).apply()
+        }
+        // Лог выгружается на диск один раз — не во время загрузки страницы
         saveLogToDownloads()
     }
 
-    override fun onDestroy() {
-        handler.removeCallbacksAndMessages(null)
-        super.onDestroy()
+    private fun startKeepAliveService() {
+        try {
+            val i = Intent(this, KeepAliveService::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(i)
+            } else {
+                startService(i)
+            }
+        } catch (e: Exception) {
+            log("app", "не удалось запустить фоновую службу: $e")
+        }
     }
 
     // --- Логирование ---
 
     private fun log(tag: String, message: String) {
+        // Только в память: файловые записи во время загрузки тормозили рендеринг
         val line = "${timeFmt.format(Date())} [$tag] $message"
         logLines.add(line)
         if (logLines.size > 500) logLines.removeAt(0)
-        try {
-            getExternalFilesDir(null)?.let { dir ->
-                File(dir, "alice_log.txt").appendText("$line\n")
-            }
-        } catch (e: Exception) { /* тишина — лог не должен ронять приложение */ }
     }
 
     private fun saveLogToDownloads() {
@@ -558,19 +699,24 @@ return out.join(' | ');
         override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
             super.onPageStarted(view, url, favicon)
             log("net", "начали грузить: $url")
-            isLoading = true
-            handler.removeCallbacks(watchdog)
-            handler.postDelayed(watchdog, WATCHDOG_SECONDS * 1000)
+            loadingProgress.progress = 0
+            statusText.text = "Загрузка… 0%"
             showLoading(true)
             showError(false)
+        }
+
+        // Первый видимый кадр — прячем оверлей сразу, не дожидаясь 100%
+        override fun onPageCommitVisible(view: WebView?, url: String?) {
+            super.onPageCommitVisible(view, url)
+            log("net", "первый кадр: $url")
+            revealPage()
+            view?.let { injectChatOnly(it) }
         }
 
         override fun onPageFinished(view: WebView?, url: String?) {
             super.onPageFinished(view, url)
             log("net", "страница загружена: $url, заголовок: «${view?.title ?: ""}»")
-            isLoading = false
-            handler.removeCallbacks(watchdog)
-            showLoading(false)
+            revealPage()
             view?.let {
                 injectChatOnly(it)
                 dumpDom(it)
@@ -604,5 +750,60 @@ return out.join(' | ');
             super.onReceivedHttpError(view, request, errorResponse)
             log("err", "HTTP ${errorResponse?.statusCode} ${request?.url}")
         }
+    }
+
+    // --- Разлитый свет вокруг пилюли: концентрические полупрозрачные кольца
+    // с затухающей яркостью — эффект мягкого ореола без капризного blur ---
+    private inner class GlowPillDrawable(private val active: Boolean) : Drawable() {
+
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        private fun dp(v: Int): Float = v * resources.displayMetrics.density
+
+        override fun draw(canvas: android.graphics.Canvas) {
+            val b = bounds
+            val pad = dp(6) // зона под свечение внутри границ view
+            val left = b.left + pad
+            val top = b.top + pad
+            val right = b.right - pad
+            val bottom = b.bottom - pad
+            val radius = (bottom - top) / 2f
+
+            if (active) {
+                val rings = 5
+                for (i in rings downTo 1) {
+                    val grow = (pad / rings) * i
+                    val alpha = 56 / i // 56, 28, 18, 14, 11 — чем дальше от пилюли, тем тусклее
+                    glowPaint.color = Color.argb(
+                        alpha,
+                        Color.red(GREEN_BRIGHT),
+                        Color.green(GREEN_BRIGHT),
+                        Color.blue(GREEN_BRIGHT)
+                    )
+                    glowPaint.strokeWidth = pad / rings
+                    canvas.drawRoundRect(
+                        left - grow, top - grow, right + grow, bottom + grow,
+                        radius + grow, radius + grow, glowPaint
+                    )
+                }
+            }
+
+            // Сама пилюля — чуть меньше прежней, чтобы освободить место под ореол
+            fillPaint.color = Color.parseColor("#AA2E2E3A")
+            canvas.drawRoundRect(left, top, right, bottom, radius, radius, fillPaint)
+        }
+
+        override fun setAlpha(alpha: Int) { /* прозрачность управляется цветами */ }
+
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) { /* не нужно */ }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
     }
 }

@@ -134,11 +134,11 @@ class MainActivity : Activity() {
         "DNS отказался отвечать. Он тоже удивлён.",
         "Не удалось сохранить лог ошибки об ошибке.",
         "Интернет не подключён. Просто поверьте.",
-        "Это работает?",
+        "Это работает? 1",
         "Загрузка видео завершена. Скачалось: ничего.",
         "Часовой пояс не найден. Зима близко.",
         "Данных нет. Всё хорошо.",
-        "Памяти достаточно?",
+        "Памяти достаточно? 1",
         "Котэ настучал на сервер лапой. Сервер не ответил.",
         "Сервер ушёл на обед. Возвращается, когда захочет.",
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
@@ -337,7 +337,7 @@ class MainActivity : Activity() {
             }
         }
     }
-   
+
     // --- Тёмная тема: алгоритмическое затемнение (преемник форс-дарка) ---
     // На Android 13+ включаем setAlgorithmicDarkeningAllowed. На более старых
     // версиях метод setForceDark отсутствует в новых SDK, поэтому вызываем
@@ -863,25 +863,19 @@ return out.join(' | ');
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { marginStart = dp(12).toInt() }
-
-            fun updateLook() {
-                background = GlowPillDrawable(switchOn)
-                setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
-                text = if (switchOn) "Вкл" else "Выкл"
-            }
-            updateLook()
-
-            // Обновление вида при изменении состояния
-            row.setOnClickListener { }
-            row.tag = this
         }
+
+        fun updateLook() {
+            switchPill.background = GlowPillDrawable(switchOn)
+            switchPill.setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
+            switchPill.text = if (switchOn) "Вкл" else "Выкл"
+        }
+        updateLook()
 
         fun toggle() {
             switchOn = !switchOn
             prefs.edit().putBoolean(key, switchOn).apply()
-            switchPill.background = GlowPillDrawable(switchOn)
-            switchPill.setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
-            switchPill.text = if (switchOn) "Вкл" else "Выкл"
+            updateLook()
             log("app", "$title: ${if (switchOn) "вкл" else "выкл"}")
             onApplied()
         }
@@ -1129,7 +1123,8 @@ return out.join(' | ');
             "ERR_HTTP2",
             "ERR_CONNECTION_ABORTED",
             "ERR_CONNECTION_RESET",
-            "ERR_TIMED_OUT"
+            "ERR_TIMED_OUT",
+            "ERR_NAME_NOT_RESOLVED"
         ).any { desc.contains(it, ignoreCase = true) }
     }
 
@@ -1187,10 +1182,15 @@ return out.join(' | ');
             if (request?.isForMainFrame == true) {
                 errorSincePageStart = true
                 if (isTransientNetError(desc) && httpRetries < MAX_HTTP_RETRIES) {
-                    // Сбои HTTP2 и обрывы соединения часто разовые: тихий автоповтор
                     httpRetries++
-                    log("net", "автоповтор загрузки ($httpRetries из $MAX_HTTP_RETRIES)")
-                    view?.postDelayed({ view.reload() }, RETRY_DELAY_MS)
+                    // DNS-сбою нужно больше времени на восстановление, чем HTTP/2-сбою
+                    val delay = if (desc.contains("ERR_NAME_NOT_RESOLVED", ignoreCase = true)) {
+                        RETRY_DELAY_MS * 2
+                    } else {
+                        RETRY_DELAY_MS
+                    }
+                    log("net", "автоповтор загрузки ($httpRetries из $MAX_HTTP_RETRIES), пауза $delay мс")
+                    view?.postDelayed({ view.reload() }, delay)
                 } else {
                     showLoading(false)
                     showError(true, desc)

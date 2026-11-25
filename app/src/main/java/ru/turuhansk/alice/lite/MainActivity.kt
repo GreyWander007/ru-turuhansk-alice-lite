@@ -337,15 +337,25 @@ class MainActivity : Activity() {
             }
         }
     }
-
-    // --- Тёмная тема (форс-дарк WebView) ---
-
-    @Suppress("DEPRECATION")
+   
+    // --- Тёмная тема: алгоритмическое затемнение (преемник форс-дарка) ---
+    // На Android 13+ включаем setAlgorithmicDarkeningAllowed. На более старых
+    // версиях метод setForceDark отсутствует в новых SDK, поэтому вызываем
+    // его через reflection с числовыми значениями (1 = выкл, 2 = вкл)
     private fun applyForceDark() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            webView.forceDark = if (forceDarkOn) View.FORCE_DARK_ON else View.FORCE_DARK_OFF
-            log("app", "форс-дарк: ${if (forceDarkOn) "вкл" else "выкл"}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            webView.settings.isAlgorithmicDarkeningAllowed = forceDarkOn
+        } else {
+            try {
+                val m = webView.settings.javaClass.getMethod(
+                    "setForceDark", Int::class.javaPrimitiveType
+                )
+                m.invoke(webView.settings, if (forceDarkOn) 2 else 1)
+            } catch (e: Exception) {
+                log("app", "затемнение недоступно на этой версии: $e")
+            }
         }
+        log("app", "тёмная тема: ${if (forceDarkOn) "вкл" else "выкл"}")
     }
 
     // --- Блокировка ориентации ---

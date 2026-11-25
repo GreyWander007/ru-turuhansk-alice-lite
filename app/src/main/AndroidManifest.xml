@@ -1,40 +1,44 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="ru.turuhansk.alice.lite">
 
+    <!-- Сеть: WebView грузит страницу Алисы -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
-    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
-    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
-    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+
+    <!-- Фоновая служба-хранитель процесса (Android 9+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Уведомление «Алиса активна» (Android 13+ запрашивается в рантайме) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Для чтения файлов в пикере на Android 12 и ниже
+         (на Android 10+ доступ выдаёт сам системный пикер) -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
 
     <application
         android:allowBackup="true"
         android:icon="@mipmap/ic_launcher"
-        android:label="@string/app_name"
-        android:hardwareAccelerated="true"
-        android:supportsRtl="true">
+        android:label="Alice Lite"
+        android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen"
+        android:windowSoftInputMode="adjustResize">
 
         <activity
             android:name=".MainActivity"
-            android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden">
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- Служба: держит процесс живым, пока приложение свернуто -->
+        <!-- Служба-хранитель: держит процесс живым, когда приложение свернуто -->
         <service
             android:name=".KeepAliveService"
             android:exported="false"
-            android:foregroundServiceType="specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="keep_webview_alive" />
-        </service>
+            android:foregroundServiceType="dataSync" />
     </application>
+
 </manifest>

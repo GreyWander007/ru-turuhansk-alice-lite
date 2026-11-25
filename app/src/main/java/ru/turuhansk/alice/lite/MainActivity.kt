@@ -6,6 +6,7 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
 import android.content.SharedPreferences
+import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
 import android.graphics.Color
@@ -19,10 +20,12 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Message
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.ViewGroup
+import android.view.View
 import android.webkit.ConsoleMessage
 import android.webkit.CookieManager
 import android.webkit.ValueCallback
@@ -37,6 +40,7 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.text.SimpleDateFormat
@@ -50,19 +54,26 @@ class MainActivity : Activity() {
     companion object {
         // Тёмная палитра
         private val BG_DARK = Color.parseColor("#141419")
+        private val CARD_BG = Color.parseColor("#1E1E26")
         private val TEXT_MAIN = Color.parseColor("#E8E8EC")
         private val TEXT_MUTED = Color.parseColor("#9A9AA6")
         private val BTN_BG = Color.parseColor("#2E2E3A")
         private val ACCENT = Color.parseColor("#7B61FF")
 
-        // Зелёная подсветка активного режима
+        // Зелёная подсветка включённых переключателей
         private val GREEN_BRIGHT = Color.parseColor("#FF4CAF50")
 
         private const val PREFS_NAME = "alice_lite_prefs"
         private const val KEY_PILL_X = "pill_x"
         private const val KEY_PILL_Y = "pill_y"
-        private const val KEY_HIDING = "hiding_enabled"
+        private const val KEY_FORCE_DARK = "force_dark"
+        private const val KEY_LOGGING = "logging_enabled"
+        private const val KEY_LOCK_ORIENTATION = "lock_orientation"
+        private const val KEY_BACKGROUND = "background_enabled"
         private const val KEY_LAST_URL = "last_url"
+        private const val KEY_LOG_DIR = "log_dir_uri"
+        private const val KEY_LOG_DIR_LABEL = "log_dir_label"
+        private const val KEY_LOG_FILE = "log_file_uri"
 
         private const val DEFAULT_URL = "https://alice.yandex.ru"
 
@@ -72,8 +83,9 @@ class MainActivity : Activity() {
         private const val REQUEST_FILE = 1001
         private const val REQUEST_STORAGE = 1002
         private const val REQUEST_NOTIFICATIONS = 1003
+        private const val REQUEST_LOG_DIR = 1004
 
-        // Автоповтор при разовых сетевых сбоях (ERR_HTTP2_PROTOCOL_ERROR)
+        // Автоповтор при разовых сетевых сбоях
         private const val MAX_HTTP_RETRIES = 2
         private const val RETRY_DELAY_MS = 1500L
     }
@@ -88,11 +100,19 @@ class MainActivity : Activity() {
     private lateinit var topProgress: ProgressBar
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
-    private lateinit var toggleBtn: TextView
+    private lateinit var settingsBtn: TextView
+    private lateinit var settingsPanel: ScrollView
+    private lateinit var logDirSubtitle: TextView
 
-    private var hidingEnabled = true
+    private var forceDarkOn = true
+    private var loggingEnabled = true
+    private var lockOrientationOn = false
+    private var backgroundEnabled = true
     private var lastLoggedProgress = -20
     private var httpRetries = 0
+    private var errorSincePageStart = false
+    private var logDirUri: Uri? = null
+    private var logDirLabel = "Загрузки"
 
     // Для выбора файлов
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
@@ -101,19 +121,6 @@ class MainActivity : Activity() {
     private val logLines = ArrayList<String>()
     private val timeFmt = SimpleDateFormat("HH:mm:ss", Locale.getDefault())
     private var domDumped = false
-
-    // Скрываем только мусор: промо, баннеры, QR, призывы скачать приложение, плашки куки.
-    // Шапку, навигацию и сайдбар НЕ трогаем — там кнопка входа и история чатов.
-    private val hideSelectors = listOf(
-        "[class*='Promo']", "[class*='promo']",
-        "[class*='Banner']", "[class*='banner']",
-        "[class*='Qr']", "[class*='qr']",
-        "[class*='Download']", "[class*='download']",
-        "[class*='Install']", "[class*='install']",
-        "[class*='Cookie']", "[class*='cookie']",
-        "[class*='Marketing']", "[class*='marketing']",
-        "[class*='Adv']", "[class*='adv']"
-    )
 
     private val funnyErrors = listOf(
         "Сегодня на смене Котэ. Мы извиняемся, что выпустили тормоза — сейчас заменим, а вы пока обновите 🐱",
@@ -127,11 +134,11 @@ class MainActivity : Activity() {
         "DNS отказался отвечать. Он тоже удивлён.",
         "Не удалось сохранить лог ошибки об ошибке.",
         "Интернет не подключён. Просто поверьте.",
-        "Это работает? 1",
+        "Это работает?",
         "Загрузка видео завершена. Скачалось: ничего.",
         "Часовой пояс не найден. Зима близко.",
         "Данных нет. Всё хорошо.",
-        "Памяти достаточно? 1",
+        "Памяти достаточно?",
         "Котэ настучал на сервер лапой. Сервер не ответил.",
         "Сервер ушёл на обед. Возвращается, когда захочет.",
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
@@ -148,12 +155,17 @@ class MainActivity : Activity() {
             val sw = java.io.StringWriter()
             e.printStackTrace(java.io.PrintWriter(sw))
             logLines.add("[crash] " + sw.toString())
-            saveLogToDownloads()
+            if (loggingEnabled) saveLogToDownloads()
             defaultHandler?.uncaughtException(Thread.currentThread(), e)
         }
 
         prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-        hidingEnabled = prefs.getBoolean(KEY_HIDING, true)
+        forceDarkOn = prefs.getBoolean(KEY_FORCE_DARK, true)
+        loggingEnabled = prefs.getBoolean(KEY_LOGGING, true)
+        lockOrientationOn = prefs.getBoolean(KEY_LOCK_ORIENTATION, false)
+        backgroundEnabled = prefs.getBoolean(KEY_BACKGROUND, true)
+        logDirUri = prefs.getString(KEY_LOG_DIR, null)?.let { Uri.parse(it) }
+        logDirLabel = prefs.getString(KEY_LOG_DIR_LABEL, null) ?: "Загрузки"
 
         log("app", "onCreate: запуск")
         logWebViewVersion()
@@ -170,7 +182,10 @@ class MainActivity : Activity() {
             )
         }
 
-        // Шторка и нижняя панель — в цвет экрана, чтобы не выделялись
+        // Блокировка ориентации применяется сразу при старте
+        applyOrientationLock()
+
+        // Шторка — в цвет экрана
         window.statusBarColor = BG_DARK
         window.navigationBarColor = BG_DARK
 
@@ -193,9 +208,6 @@ class MainActivity : Activity() {
         errorView.visibility = android.view.View.GONE
         root.addView(errorView)
 
-        toggleBtn = makeToggleButton()
-        root.addView(toggleBtn)
-
         // Тонкая полоска поверх страницы: видна, пока загрузка не завершилась
         // окончательно (прячется только в onPageFinished, не по процентам)
         topProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
@@ -211,9 +223,20 @@ class MainActivity : Activity() {
         }
         root.addView(topProgress)
 
+        settingsBtn = makeSettingsButton()
+        root.addView(settingsBtn)
+
+        // Панель настроек поверх всего, скрыта до вызова
+        settingsPanel = makeSettingsPanel()
+        settingsPanel.visibility = android.view.View.GONE
+        root.addView(settingsPanel)
+
         loadingView.visibility = android.view.View.VISIBLE
 
         setContentView(root)
+
+        // Тема применяется сразу при старте — из сохранённых настроек
+        applyForceDark()
 
         // Восстановление сессии: если система пересоздала активити — возвращаем
         // состояние WebView (включая историю переходов и открытый чат)
@@ -305,7 +328,6 @@ class MainActivity : Activity() {
                 }
                 if (newProgress >= SHOW_AT_PROGRESS) {
                     revealPage()
-                    if (newProgress >= 100) view?.let { injectChatOnly(it) }
                 }
             }
 
@@ -313,6 +335,26 @@ class MainActivity : Activity() {
                 log("js", "${message.message()} (${message.lineNumber()})")
                 return true
             }
+        }
+    }
+
+    // --- Тёмная тема (форс-дарк WebView) ---
+
+    @Suppress("DEPRECATION")
+    private fun applyForceDark() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            webView.forceDark = if (forceDarkOn) View.FORCE_DARK_ON else View.FORCE_DARK_OFF
+            log("app", "форс-дарк: ${if (forceDarkOn) "вкл" else "выкл"}")
+        }
+    }
+
+    // --- Блокировка ориентации ---
+
+    private fun applyOrientationLock() {
+        requestedOrientation = if (lockOrientationOn) {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
     }
 
@@ -368,8 +410,52 @@ class MainActivity : Activity() {
                 log("app", "выбор файла отменён")
             }
             callback?.onReceiveValue(result ?: arrayOf())
+        } else if (requestCode == REQUEST_LOG_DIR) {
+            if (resultCode == RESULT_OK && data?.data != null) {
+                val uri = data.data!!
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    )
+                    logDirUri = uri
+                    logDirLabel = dirDisplayName(uri) ?: "выбранная папка"
+                    prefs.edit()
+                        .putString(KEY_LOG_DIR, uri.toString())
+                        .putString(KEY_LOG_DIR_LABEL, logDirLabel)
+                        // старый файл в предыдущей папке больше не актуален
+                        .putString(KEY_LOG_FILE, null)
+                        .apply()
+                    if (this::logDirSubtitle.isInitialized) {
+                        logDirSubtitle.text = "Сейчас: $logDirLabel"
+                    }
+                    log("app", "папка лога: $logDirLabel")
+                } catch (e: Exception) {
+                    log("err", "не удалось закрепить доступ к папке: $e")
+                }
+            } else {
+                log("app", "выбор папки лога отменён")
+            }
         } else {
             super.onActivityResult(requestCode, resultCode, data)
+        }
+    }
+
+    // Имя выбранной папки для подписи в настройках
+    private fun dirDisplayName(uri: Uri): String? {
+        return try {
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(
+                uri, DocumentsContract.getTreeDocumentId(uri)
+            )
+            contentResolver.query(
+                docUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                null, null, null
+            )?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -396,43 +482,6 @@ class MainActivity : Activity() {
         } else {
             super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         }
-    }
-
-    // --- Инъекция: стиль прячется/показывается классом на body, поэтому переключаемо ---
-
-    private fun injectChatOnly(wv: WebView) {
-        val selJson = hideSelectors.joinToString(",") { "\"$it\"" }
-        val enabled = if (hidingEnabled) "true" else "false"
-        val script = """
-(function(){
-window.__hideUi = $enabled;
-if(!window.__aliceCssOn){
-  window.__aliceCssOn = true;
-  var st=document.createElement('style');
-  st.id='__aliceCss';
-  st.textContent='body.__aliceHideUi ' + [[$selJson].join(',')].join(',') + ' {display:none!important}';
-  (document.head||document.documentElement).appendChild(st);
-  var mo=new MutationObserver(function(){
-    if(!document.getElementById('__aliceCss')){
-      var s2=document.createElement('style');
-      s2.id='__aliceCss';
-      s2.textContent='body.__aliceHideUi ' + [[$selJson].join(',')].join(',') + ' {display:none!important}';
-      (document.head||document.documentElement).appendChild(s2);
-    }
-    if(document.body && window.__hideUi===true && !document.body.classList.contains('__aliceHideUi')){
-      document.body.classList.add('__aliceHideUi');
-    }
-  });
-  mo.observe(document.documentElement,{childList:true,subtree:true});
-}
-if(document.body){
-  if(window.__hideUi===true){ document.body.classList.add('__aliceHideUi'); }
-  else { document.body.classList.remove('__aliceHideUi'); }
-}
-})();
-""".trimIndent()
-
-        wv.evaluateJavascript(script) { _ -> log("inject", "инъекция применена (hide=$enabled)") }
     }
 
     // Разовый дамп верхнего уровня страницы — для подбора точных селекторов
@@ -486,12 +535,7 @@ return out.join(' | ');
         }
     }
 
-    // Обновление вида пилюли в зависимости от режима.
-    // btn передаётся явно: при первом создании toggleBtn ещё не присвоен
-    private fun refreshPillLook(btn: TextView) {
-        btn.background = GlowPillDrawable(hidingEnabled)
-        btn.setTextColor(if (hidingEnabled) GREEN_BRIGHT else TEXT_MUTED)
-    }
+    private fun dp(v: Int): Float = v * resources.displayMetrics.density
 
     private fun makeLoadingView(): LinearLayout {
         val box = LinearLayout(this).apply {
@@ -594,22 +638,22 @@ return out.join(' | ');
         return box
     }
 
-    // Переключатель: пилюля с перетаскиванием, позиция запоминается между запусками,
-    // разлитый зелёный ореол в активном режиме, без него — в пассивном
+    // --- Кнопка настроек: пилюля с перетаскиванием, позиция запоминается ---
+
     @SuppressLint("ClickableViewAccessibility")
-    private fun makeToggleButton(): TextView {
+    private fun makeSettingsButton(): TextView {
         return TextView(this).apply {
-            text = if (hidingEnabled) "только чат" else "показать всё"
+            text = "⚙ Настройки"
             textSize = 12f
             setPadding(34, 16, 34, 16)
-            refreshPillLook(this) // фон и цвет текста по текущему состоянию
+            setTextColor(TEXT_MUTED)
+            background = GlowPillDrawable(false)
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP or Gravity.CENTER_HORIZONTAL
             ).apply { setMargins(0, 24, 0, 0) }
 
-            // Возвращаем сохранённую позицию
             translationX = prefs.getFloat(KEY_PILL_X, 0f)
             translationY = prefs.getFloat(KEY_PILL_Y, 0f)
 
@@ -635,24 +679,278 @@ return out.join(' | ');
                     }
                     MotionEvent.ACTION_UP -> {
                         if (moved) {
-                            // Запоминаем позицию
                             prefs.edit()
                                 .putFloat(KEY_PILL_X, v.translationX)
                                 .putFloat(KEY_PILL_Y, v.translationY)
                                 .apply()
                         } else {
-                            hidingEnabled = !hidingEnabled
-                            prefs.edit().putBoolean(KEY_HIDING, hidingEnabled).apply()
-                            text = if (hidingEnabled) "только чат" else "показать всё"
-                            refreshPillLook(toggleBtn)
-                            log("app", "переключатель: hide=$hidingEnabled")
-                            injectChatOnly(webView)
+                            toggleSettingsPanel()
                         }
                         true
                     }
                     else -> false
                 }
             }
+        }
+    }
+
+    private fun toggleSettingsPanel() {
+        val visible = settingsPanel.visibility == android.view.View.VISIBLE
+        settingsPanel.visibility =
+            if (visible) android.view.View.GONE else android.view.View.VISIBLE
+        log("app", if (visible) "настройки закрыты" else "настройки открыты")
+    }
+
+    // --- Панель настроек: тёмные карточки со скруглением, выключатели-пилюли ---
+
+    private fun makeSettingsPanel(): ScrollView {
+        val pad = dp(20).toInt()
+        val gap = dp(12).toInt()
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+
+        val header = TextView(this).apply {
+            text = "Настройки"
+            textSize = 22f
+            setTextColor(TEXT_MAIN)
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(0, 0, 0, gap)
+        }
+        content.addView(header)
+
+        // 1. Тёмная тема
+        content.addView(
+            makeSettingsRow(
+                title = "Тёмная тема",
+                subtitle = "Затемнять страницу движком WebView",
+                key = KEY_FORCE_DARK,
+                defaultValue = true,
+                onApplied = { applyForceDark() }
+            )
+        )
+
+        // 2. Файл лога
+        content.addView(
+            makeSettingsRow(
+                title = "Файл лога",
+                subtitle = "Сохранять alice_log.txt при сворачивании",
+                key = KEY_LOGGING,
+                defaultValue = true,
+                onApplied = { }
+            )
+        )
+
+        // 2а. Место сохранения лога (SAF-папка на выбор)
+        logDirSubtitle = TextView(this).apply {
+            text = "Сейчас: $logDirLabel"
+            textSize = 12f
+            setTextColor(TEXT_MUTED)
+        }
+        content.addView(
+            makeSettingsAction(
+                title = "Место сохранения лога",
+                subtitleView = logDirSubtitle,
+                buttonLabel = "Выбрать",
+                onClick = { openLogDirPicker() }
+            )
+        )
+
+        // 3. Блокировка ориентации
+        content.addView(
+            makeSettingsRow(
+                title = "Блокировка ориентации",
+                subtitle = "Всегда вертикальный экран",
+                key = KEY_LOCK_ORIENTATION,
+                defaultValue = false,
+                onApplied = { applyOrientationLock() }
+            )
+        )
+
+        // 4. Работа в фоне
+        content.addView(
+            makeSettingsRow(
+                title = "Работа в фоне",
+                subtitle = "Держать чат живым, когда приложение свернуто",
+                key = KEY_BACKGROUND,
+                defaultValue = true,
+                onApplied = { }
+            )
+        )
+
+        val done = Button(this).apply {
+            text = "Готово"
+            setTextColor(TEXT_MAIN)
+            background = pillDrawable(BTN_BG, 28f)
+            setPadding(64, 28, 64, 28)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = gap; gravity = Gravity.CENTER_HORIZONTAL }
+            setOnClickListener { toggleSettingsPanel() }
+        }
+        content.addView(done)
+
+        return ScrollView(this).apply {
+            setBackgroundColor(BG_DARK)
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        }.also { it.addView(content) }
+    }
+
+    // Строка настройки: карточка с названием, пояснением и пилюлей-выключателем.
+    // Изменения пишутся в prefs и сразу применяются через onApplied
+    private fun makeSettingsRow(
+        title: String,
+        subtitle: String,
+        key: String,
+        defaultValue: Boolean,
+        onApplied: () -> Unit
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(CARD_BG)
+                cornerRadius = dp(16)
+            }
+            setPadding(dp(16).toInt(), dp(14).toInt(), dp(16).toInt(), dp(14).toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12).toInt() }
+        }
+
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            )
+        }
+
+        val titleView = TextView(this).apply {
+            text = title
+            textSize = 16f
+            setTextColor(TEXT_MAIN)
+        }
+        val subtitleView = TextView(this).apply {
+            text = subtitle
+            textSize = 12f
+            setTextColor(TEXT_MUTED)
+        }
+        textCol.addView(titleView)
+        textCol.addView(subtitleView)
+
+        var switchOn = prefs.getBoolean(key, defaultValue)
+        val switchPill = TextView(this).apply {
+            textSize = 12f
+            setPadding(28, 12, 28, 12)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12).toInt() }
+
+            fun updateLook() {
+                background = GlowPillDrawable(switchOn)
+                setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
+                text = if (switchOn) "Вкл" else "Выкл"
+            }
+            updateLook()
+
+            // Обновление вида при изменении состояния
+            row.setOnClickListener { }
+            row.tag = this
+        }
+
+        fun toggle() {
+            switchOn = !switchOn
+            prefs.edit().putBoolean(key, switchOn).apply()
+            switchPill.background = GlowPillDrawable(switchOn)
+            switchPill.setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
+            switchPill.text = if (switchOn) "Вкл" else "Выкл"
+            log("app", "$title: ${if (switchOn) "вкл" else "выкл"}")
+            onApplied()
+        }
+
+        row.setOnClickListener { toggle() }
+        switchPill.setOnClickListener { toggle() }
+
+        row.addView(textCol)
+        row.addView(switchPill)
+        return row
+    }
+
+    // Строчка-действие в настройках: карточка с кнопкой вместо выключателя
+    private fun makeSettingsAction(
+        title: String,
+        subtitleView: TextView,
+        buttonLabel: String,
+        onClick: () -> Unit
+    ): LinearLayout {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(CARD_BG)
+                cornerRadius = dp(16)
+            }
+            setPadding(dp(16).toInt(), dp(14).toInt(), dp(16).toInt(), dp(14).toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(12).toInt() }
+        }
+
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
+            )
+        }
+
+        val titleView = TextView(this).apply {
+            text = title
+            textSize = 16f
+            setTextColor(TEXT_MAIN)
+        }
+        textCol.addView(titleView)
+        textCol.addView(subtitleView)
+
+        val pill = TextView(this).apply {
+            text = buttonLabel
+            textSize = 12f
+            setTextColor(TEXT_MAIN)
+            setPadding(28, 12, 28, 12)
+            background = GlowPillDrawable(false)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12).toInt() }
+            setOnClickListener { onClick() }
+        }
+
+        row.addView(textCol)
+        row.addView(pill)
+        return row
+    }
+
+    // Выбор папки для лога: системный SAF-пикер, доступ закрепляется навсегда
+    private fun openLogDirPicker() {
+        try {
+            val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                addFlags(
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                        Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            startActivityForResult(i, REQUEST_LOG_DIR)
+        } catch (e: Exception) {
+            log("err", "пикер папки недоступен: $e")
         }
     }
 
@@ -689,6 +987,12 @@ return out.join(' | ');
     // --- Жизненный цикл ---
 
     override fun onBackPressed() {
+        if (this::settingsPanel.isInitialized &&
+            settingsPanel.visibility == android.view.View.VISIBLE
+        ) {
+            toggleSettingsPanel()
+            return
+        }
         if (this::webView.isInitialized && webView.canGoBack()) {
             webView.goBack()
         } else {
@@ -704,15 +1008,15 @@ return out.join(' | ');
 
     override fun onPause() {
         super.onPause()
-        // Пока приложение свернуто, служба держит процесс живым — чат не умирает
-        startKeepAliveService()
+        // Пока приложение свернуто, служба держит процесс живым — если она разрешена
+        if (backgroundEnabled) startKeepAliveService()
         // Запоминаем последнюю открытую страницу
         val url = webView.url
         if (!url.isNullOrEmpty()) {
             prefs.edit().putString(KEY_LAST_URL, url).apply()
         }
         // Лог выгружается на диск один раз — не во время загрузки страницы
-        saveLogToDownloads()
+        if (loggingEnabled) saveLogToDownloads()
     }
 
     private fun startKeepAliveService() {
@@ -731,16 +1035,22 @@ return out.join(' | ');
     // --- Логирование ---
 
     private fun log(tag: String, message: String) {
-        // Только в память: файловые записи во время загрузки тормозили рендеринг
         val line = "${timeFmt.format(Date())} [$tag] $message"
+        // Склейка одинаковых соседних строк: SPA-страница стреляет одними и теми
+        // же событиями по несколько раз подряд, лог не должен в них тонуть
+        if (logLines.isNotEmpty() && logLines.last() == line) return
         logLines.add(line)
         if (logLines.size > 500) logLines.removeAt(0)
     }
 
+    // Запись лога: в выбранную SAF-папку, при недоступности — откат в «Загрузки».
+    // Файл один и тот же (alice_log.txt), он перезаписывается, а не плодит копии
     private fun saveLogToDownloads() {
         try {
             val content = logLines.joinToString("\n")
             if (content.isEmpty()) return
+            if (logDirUri != null && writeLogToSaf(content)) return
+            // Откат: стандартная папка «Загрузки»
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val existingId = contentResolver.query(
                     MediaStore.Downloads.EXTERNAL_CONTENT_URI,
@@ -768,7 +1078,50 @@ return out.join(' | ');
         } catch (e: Exception) { /* тишина */ }
     }
 
+    // Запись в папку, выбранную через SAF. Документ создаётся один раз и
+    // запоминается — дальше открываем его на перезапись
+    private fun writeLogToSaf(content: String): Boolean {
+        val tree = logDirUri ?: return false
+        return try {
+            val fileUriStr = prefs.getString(KEY_LOG_FILE, null)
+            var opened = false
+            if (fileUriStr != null) {
+                try {
+                    contentResolver.openOutputStream(Uri.parse(fileUriStr), "wt")?.use {
+                        it.write(content.toByteArray())
+                        opened = true
+                    }
+                } catch (e: Exception) {
+                    // файл недоступен — создадим заново
+                }
+            }
+            if (!opened) {
+                val parentDoc = DocumentsContract.buildDocumentUriUsingTree(
+                    tree, DocumentsContract.getTreeDocumentId(tree)
+                )
+                val newUri = DocumentsContract.createDocument(
+                    contentResolver, parentDoc, "text/plain", "alice_log.txt"
+                ) ?: return false
+                prefs.edit().putString(KEY_LOG_FILE, newUri.toString()).apply()
+                contentResolver.openOutputStream(newUri, "wt")?.use { it.write(content.toByteArray()) }
+            }
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     // --- Клиент WebView ---
+
+    // Разовые сетевые сбои: лечатся одним тихим повтором без экрана ошибки
+    private fun isTransientNetError(desc: String): Boolean {
+        return listOf(
+            "ERR_HTTP2",
+            "ERR_CONNECTION_ABORTED",
+            "ERR_CONNECTION_RESET",
+            "ERR_TIMED_OUT"
+        ).any { desc.contains(it, ignoreCase = true) }
+    }
 
     private inner class AliceWebViewClient : WebViewClient() {
 
@@ -780,6 +1133,7 @@ return out.join(' | ');
             topProgress.visibility = android.view.View.VISIBLE
             statusText.text = "Загрузка… 0%"
             lastLoggedProgress = -20 // чтобы прогресс новых загрузок снова писался в лог
+            errorSincePageStart = false
             showLoading(true)
             showError(false)
         }
@@ -789,7 +1143,6 @@ return out.join(' | ');
             super.onPageCommitVisible(view, url)
             log("net", "первый кадр: $url")
             revealPage()
-            view?.let { injectChatOnly(it) }
         }
 
         override fun onPageFinished(view: WebView?, url: String?) {
@@ -798,9 +1151,10 @@ return out.join(' | ');
             // Полоска сверху убирается только здесь — по факту полной загрузки
             topProgress.progress = 100
             topProgress.visibility = android.view.View.GONE
+            // Загрузка прошла чисто — копим лимит повторов заново
+            if (!errorSincePageStart) httpRetries = 0
             revealPage()
             view?.let {
-                injectChatOnly(it)
                 dumpDom(it)
                 jsProbe(it, "по завершении")
                 it.postDelayed({ if (!isFinishing) jsProbe(it, "через 10с") }, 10000)
@@ -821,9 +1175,9 @@ return out.join(' | ');
             val desc = error?.description?.toString() ?: "неизвестная ошибка"
             log("err", "$desc (url=${request?.url})")
             if (request?.isForMainFrame == true) {
-                // HTTP2-сбои часто разовые: тихий автоповтор вместо ошибки на экране
-                val isHttp2 = desc.contains("ERR_HTTP2", ignoreCase = true)
-                if (isHttp2 && httpRetries < MAX_HTTP_RETRIES) {
+                errorSincePageStart = true
+                if (isTransientNetError(desc) && httpRetries < MAX_HTTP_RETRIES) {
+                    // Сбои HTTP2 и обрывы соединения часто разовые: тихий автоповтор
                     httpRetries++
                     log("net", "автоповтор загрузки ($httpRetries из $MAX_HTTP_RETRIES)")
                     view?.postDelayed({ view.reload() }, RETRY_DELAY_MS)
@@ -844,8 +1198,8 @@ return out.join(' | ');
         }
     }
 
-    // --- Разлитый свет вокруг пилюли: концентрические полупрозрачные кольца
-    // с затухающей яркостью — эффект мягкого ореола без капризного blur ---
+    // --- Зелёный ореол вокруг пилюль: концентрические полупрозрачные кольца
+    // с затухающей яркостью — эффект мягкого свечения без капризного blur ---
     private inner class GlowPillDrawable(private val active: Boolean) : Drawable() {
 
         private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {

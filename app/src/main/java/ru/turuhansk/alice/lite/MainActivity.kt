@@ -40,7 +40,6 @@ import android.widget.Button
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.ScrollView
 import android.widget.TextView
 import java.io.File
 import java.text.SimpleDateFormat
@@ -55,6 +54,7 @@ class MainActivity : Activity() {
         // Тёмная палитра
         private val BG_DARK = Color.parseColor("#141419")
         private val CARD_BG = Color.parseColor("#1E1E26")
+        private val BAR_BG = Color.parseColor("#191921")
         private val TEXT_MAIN = Color.parseColor("#E8E8EC")
         private val TEXT_MUTED = Color.parseColor("#9A9AA6")
         private val BTN_BG = Color.parseColor("#2E2E3A")
@@ -64,8 +64,6 @@ class MainActivity : Activity() {
         private val GREEN_BRIGHT = Color.parseColor("#FF4CAF50")
 
         private const val PREFS_NAME = "alice_lite_prefs"
-        private const val KEY_PILL_X = "pill_x"
-        private const val KEY_PILL_Y = "pill_y"
         private const val KEY_FORCE_DARK = "force_dark"
         private const val KEY_LOGGING = "logging_enabled"
         private const val KEY_LOCK_ORIENTATION = "lock_orientation"
@@ -88,6 +86,11 @@ class MainActivity : Activity() {
         // Автоповтор при разовых сетевых сбоях
         private const val MAX_HTTP_RETRIES = 2
         private const val RETRY_DELAY_MS = 1500L
+
+        // Жест «назад»: краевые зоны и пороги срабатывания
+        private const val EDGE_WIDTH_DP = 24
+        private const val SWIPE_THRESHOLD_DP = 90
+        private const val SWIPE_MAX_VERTICAL_DP = 60
     }
 
     private lateinit var prefs: SharedPreferences
@@ -100,9 +103,15 @@ class MainActivity : Activity() {
     private lateinit var topProgress: ProgressBar
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
-    private lateinit var settingsBtn: TextView
-    private lateinit var settingsPanel: ScrollView
-    private lateinit var logDirSubtitle: TextView
+
+    // Нижний бар с иконками-переключателями и пузырь настроек лога
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var themeIcon: TextView
+    private lateinit var orientIcon: TextView
+    private lateinit var logIcon: TextView
+    private lateinit var gearIcon: TextView
+    private lateinit var dirBubble: LinearLayout
+    private lateinit var dirBubbleSubtitle: TextView
 
     private var forceDarkOn = true
     private var loggingEnabled = true
@@ -144,6 +153,8 @@ class MainActivity : Activity() {
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
         "Версия новейшая, данных нет. Как всегда."
     )
+
+    private fun barHeightPx(): Int = dp(56).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -189,24 +200,36 @@ class MainActivity : Activity() {
         window.statusBarColor = BG_DARK
         window.navigationBarColor = BG_DARK
 
+        val barH = barHeightPx()
+
         val root = FrameLayout(this).apply { setBackgroundColor(BG_DARK) }
 
         webView = WebView(this).apply {
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-            )
+            ).apply { bottomMargin = barH } // приподняли чат над нижним баром
             setBackgroundColor(BG_DARK)
             setupWebView(this)
         }
         root.addView(webView)
 
-        loadingView = makeLoadingView()
+        // Краевые зоны жеста «назад»: свайп от левого края вправо
+        // или от правого края влево возвращает на предыдущую страницу
+        root.addView(makeEdgeOverlay(isLeft = true, bottomMargin = barH))
+        root.addView(makeEdgeOverlay(isLeft = false, bottomMargin = barH))
+
+        loadingView = makeLoadingView(barH)
         root.addView(loadingView)
 
-        errorView = makeErrorView()
+        errorView = makeErrorView(barH)
         errorView.visibility = android.view.View.GONE
         root.addView(errorView)
+
+        // Пузырь настроек лога: над баром, прижат к шестерёнке, скрыт до вызова
+        dirBubble = makeDirBubble(barH)
+        dirBubble.visibility = android.view.View.GONE
+        root.addView(dirBubble)
 
         // Тонкая полоска поверх страницы: видна, пока загрузка не завершилась
         // окончательно (прячется только в onPageFinished, не по процентам)
@@ -223,13 +246,8 @@ class MainActivity : Activity() {
         }
         root.addView(topProgress)
 
-        settingsBtn = makeSettingsButton()
-        root.addView(settingsBtn)
-
-        // Панель настроек поверх всего, скрыта до вызова
-        settingsPanel = makeSettingsPanel()
-        settingsPanel.visibility = android.view.View.GONE
-        root.addView(settingsPanel)
+        bottomBar = makeBottomBar()
+        root.addView(bottomBar) // бар последним — поверх всего
 
         loadingView.visibility = android.view.View.VISIBLE
 
@@ -266,7 +284,7 @@ class MainActivity : Activity() {
         }
     }
 
-    @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
+    @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebView(wv: WebView) {
         wv.settings.apply {
             javaScriptEnabled = true
@@ -366,6 +384,80 @@ class MainActivity : Activity() {
         } else {
             ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         }
+        log("app", "ориентация: ${if (lockOrientationOn) "фиксирована" else "свободна"}")
+    }
+
+    // --- Жест «назад»: краевые зоны ---
+
+    // Прозрачная зона вдоль края экрана. Квалифицированный горизонтальный свайп
+    // от края запускает «назад»; случайный тап в узкой зоне передаётся в WebView,
+    // чтобы нажатия у края не терялись
+    @SuppressLint("ClickableViewAccessibility")
+    private fun makeEdgeOverlay(isLeft: Boolean, bottomMargin: Int): View {
+        val zone = View(this)
+        zone.layoutParams = FrameLayout.LayoutParams(
+            dp(EDGE_WIDTH_DP).toInt(),
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            if (isLeft) Gravity.START else Gravity.END
+        ).apply { this.bottomMargin = bottomMargin }
+
+        var downX = 0f
+        var downY = 0f
+        var tracking = false
+
+        zone.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downX = e.rawX; downY = e.rawY; tracking = true
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    if (tracking) {
+                        val dx = e.rawX - downX
+                        val dy = e.rawY - downY
+                        val horiz = abs(dx)
+                        val vert = abs(dy)
+                        val directionOk = if (isLeft) dx > 0 else dx < 0
+                        if (horiz >= dp(SWIPE_THRESHOLD_DP) &&
+                            vert <= dp(SWIPE_MAX_VERTICAL_DP) &&
+                            directionOk
+                        ) {
+                            performBack()
+                        } else if (horiz < dp(10) && vert < dp(10)) {
+                            // Тап без движения: передаём в WebView как нажатие
+                            webView.dispatchTouchEvent(
+                                MotionEvent.obtain(
+                                    e.downTime, e.eventTime,
+                                    MotionEvent.ACTION_DOWN, e.x, e.y, 0
+                                )
+                            )
+                            webView.dispatchTouchEvent(
+                                MotionEvent.obtain(
+                                    e.downTime, e.eventTime,
+                                    MotionEvent.ACTION_UP, e.x, e.y, 0
+                                )
+                            )
+                        }
+                    }
+                    tracking = false
+                    true
+                }
+                else -> true
+            }
+        }
+        return zone
+    }
+
+    // Единая точка «назад»: сначала закрываем пузырь, потом идём по истории
+    private fun performBack() {
+        if (this::dirBubble.isInitialized && dirBubble.visibility == View.VISIBLE) {
+            hideDirBubble()
+            return
+        }
+        if (this::webView.isInitialized && webView.canGoBack()) {
+            log("app", "жест: назад")
+            webView.goBack()
+        }
     }
 
     // --- Выбор файлов ---
@@ -438,9 +530,7 @@ class MainActivity : Activity() {
                         // старый файл в предыдущей папке больше не актуален
                         .putString(KEY_LOG_FILE, null)
                         .apply()
-                    if (this::logDirSubtitle.isInitialized) {
-                        logDirSubtitle.text = "Сейчас: $logDirLabel"
-                    }
+                    dirBubbleSubtitle.text = "Сейчас: $logDirLabel"
                     log("app", "папка лога: $logDirLabel")
                 } catch (e: Exception) {
                     log("err", "не удалось закрепить доступ к папке: $e")
@@ -453,7 +543,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // Имя выбранной папки для подписи в настройках
+    // Имя выбранной папки для подписи в пузыре
     private fun dirDisplayName(uri: Uri): String? {
         return try {
             val docUri = DocumentsContract.buildDocumentUriUsingTree(
@@ -547,7 +637,7 @@ return out.join(' | ');
 
     private fun dp(v: Int): Float = v * resources.displayMetrics.density
 
-    private fun makeLoadingView(): LinearLayout {
+    private fun makeLoadingView(bottomMargin: Int): LinearLayout {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -555,7 +645,7 @@ return out.join(' | ');
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-            )
+            ).apply { this.bottomMargin = bottomMargin }
         }
 
         statusText = TextView(this).apply {
@@ -591,7 +681,7 @@ return out.join(' | ');
         return box
     }
 
-    private fun makeErrorView(): LinearLayout {
+    private fun makeErrorView(bottomMargin: Int): LinearLayout {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
@@ -599,7 +689,7 @@ return out.join(' | ');
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
-            )
+            ).apply { this.bottomMargin = bottomMargin }
         }
 
         funnyText = TextView(this).apply {
@@ -648,298 +738,194 @@ return out.join(' | ');
         return box
     }
 
-    // --- Кнопка настроек: пилюля с перетаскиванием, позиция запоминается ---
+    // --- Нижний бар: иконки-переключатели слева, шестерёнка справа ---
 
-    @SuppressLint("ClickableViewAccessibility")
-    private fun makeSettingsButton(): TextView {
-        return TextView(this).apply {
-            text = "⚙ Настройки"
-            textSize = 12f
-            setPadding(34, 16, 34, 16)
-            setTextColor(TEXT_MUTED)
-            background = GlowPillDrawable(false)
+    private fun makeBottomBar(): LinearLayout {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(BAR_BG)
             layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                barHeightPx(),
+                Gravity.BOTTOM
+            )
+        }
+
+        // Левая группа: три переключателя по центру оставшегося места
+        val leftGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.MATCH_PARENT, 1f
+            )
+        }
+
+        fun barIcon(symbol: String): TextView {
+            return TextView(this).apply {
+                text = symbol
+                textSize = 22f
+                setPadding(dp(14).toInt(), 0, dp(14).toInt(), 0)
+                gravity = Gravity.CENTER
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+            }
+        }
+
+        themeIcon = barIcon(if (forceDarkOn) "🌙" else "☀️")
+        themeIcon.setOnClickListener {
+            forceDarkOn = !forceDarkOn
+            prefs.edit().putBoolean(KEY_FORCE_DARK, forceDarkOn).apply()
+            applyForceDark()
+            refreshBarIcons()
+            if (this::webView.isInitialized) webView.reload() // тема применяется к следующей загрузке
+        }
+
+        orientIcon = barIcon(if (lockOrientationOn) "🔒" else "🔓")
+        orientIcon.setOnClickListener {
+            lockOrientationOn = !lockOrientationOn
+            prefs.edit().putBoolean(KEY_LOCK_ORIENTATION, lockOrientationOn).apply()
+            applyOrientationLock()
+            refreshBarIcons()
+        }
+
+        logIcon = barIcon("📝")
+        logIcon.setOnClickListener {
+            loggingEnabled = !loggingEnabled
+            prefs.edit().putBoolean(KEY_LOGGING, loggingEnabled).apply()
+            if (!loggingEnabled) hideDirBubble()
+            refreshBarIcons()
+            log("app", "запись лога: ${if (loggingEnabled) "вкл" else "выкл"}")
+        }
+
+        leftGroup.addView(themeIcon)
+        leftGroup.addView(orientIcon)
+        leftGroup.addView(logIcon)
+        bar.addView(leftGroup)
+
+        gearIcon = TextView(this).apply {
+            text = "⚙️"
+            textSize = 22f
+            gravity = Gravity.CENTER
+            setPadding(dp(20).toInt(), 0, dp(20).toInt(), 0)
+            layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            ).apply { setMargins(0, 24, 0, 0) }
-
-            translationX = prefs.getFloat(KEY_PILL_X, 0f)
-            translationY = prefs.getFloat(KEY_PILL_Y, 0f)
-
-            var downX = 0f
-            var downY = 0f
-            var moved = false
-
-            setOnTouchListener { v, e ->
-                when (e.action) {
-                    MotionEvent.ACTION_DOWN -> {
-                        downX = e.rawX; downY = e.rawY; moved = false; true
-                    }
-                    MotionEvent.ACTION_MOVE -> {
-                        val dx = e.rawX - downX
-                        val dy = e.rawY - downY
-                        if (abs(dx) > 8 || abs(dy) > 8) {
-                            moved = true
-                            v.translationX += dx
-                            v.translationY += dy
-                            downX = e.rawX; downY = e.rawY
-                        }
-                        true
-                    }
-                    MotionEvent.ACTION_UP -> {
-                        if (moved) {
-                            prefs.edit()
-                                .putFloat(KEY_PILL_X, v.translationX)
-                                .putFloat(KEY_PILL_Y, v.translationY)
-                                .apply()
-                        } else {
-                            toggleSettingsPanel()
-                        }
-                        true
-                    }
-                    else -> false
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+            setOnClickListener {
+                if (!loggingEnabled) {
+                    log("app", "шестерёнка неактивна: запись лога выключена")
+                    return@setOnClickListener
+                }
+                if (dirBubble.visibility == View.VISIBLE) {
+                    hideDirBubble()
+                } else {
+                    showDirBubble()
                 }
             }
         }
+        bar.addView(gearIcon)
+
+        refreshBarIcons()
+        return bar
     }
 
-    private fun toggleSettingsPanel() {
-        val visible = settingsPanel.visibility == android.view.View.VISIBLE
-        settingsPanel.visibility =
-            if (visible) android.view.View.GONE else android.view.View.VISIBLE
-        log("app", if (visible) "настройки закрыты" else "настройки открыты")
+    // Обновление вида иконок: зелёный цвет — включено, приглушённый — выключено.
+    // Шестерёнка активна только при включённой записи лога
+    private fun refreshBarIcons() {
+        themeIcon.text = if (forceDarkOn) "🌙" else "☀️"
+        themeIcon.setTextColor(if (forceDarkOn) GREEN_BRIGHT else TEXT_MUTED)
+
+        orientIcon.text = if (lockOrientationOn) "🔒" else "🔓"
+        orientIcon.setTextColor(if (lockOrientationOn) GREEN_BRIGHT else TEXT_MUTED)
+
+        logIcon.setTextColor(if (loggingEnabled) GREEN_BRIGHT else TEXT_MUTED)
+
+        gearIcon.setTextColor(if (loggingEnabled) TEXT_MAIN else Color.parseColor("#4A4A55"))
+        gearIcon.alpha = if (loggingEnabled) 1f else 0.45f
     }
 
-    // --- Панель настроек: тёмные карточки со скруглением, выключатели-пилюли ---
+    // --- Пузырь настроек лога: над баром, прижат к шестерёнке ---
 
-    private fun makeSettingsPanel(): ScrollView {
-        val pad = dp(20).toInt()
-        val gap = dp(12).toInt()
-
-        val content = LinearLayout(this).apply {
+    private fun makeDirBubble(barH: Int): LinearLayout {
+        val bubble = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
+            background = GradientDrawable().apply {
+                setColor(CARD_BG)
+                cornerRadius = dp(18)
+            }
+            setPadding(dp(18).toInt(), dp(14).toInt(), dp(18).toInt(), dp(14).toInt())
+            layoutParams = FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                bottomMargin = barH + dp(10).toInt()
+                marginEnd = dp(12).toInt()
+            }
         }
 
-        val header = TextView(this).apply {
-            text = "Настройки"
-            textSize = 22f
+        val title = TextView(this).apply {
+            text = "Место сохранения лога"
+            textSize = 15f
             setTextColor(TEXT_MAIN)
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, 0, 0, gap)
         }
-        content.addView(header)
+        bubble.addView(title)
 
-        // 1. Тёмная тема
-        content.addView(
-            makeSettingsRow(
-                title = "Тёмная тема",
-                subtitle = "Затемнять страницу движком WebView",
-                key = KEY_FORCE_DARK,
-                defaultValue = true,
-                onApplied = { applyForceDark() }
-            )
-        )
-
-        // 2. Файл лога
-        content.addView(
-            makeSettingsRow(
-                title = "Файл лога",
-                subtitle = "Сохранять alice_log.txt при сворачивании",
-                key = KEY_LOGGING,
-                defaultValue = true,
-                onApplied = { }
-            )
-        )
-
-        // 2а. Место сохранения лога (SAF-папка на выбор)
-        logDirSubtitle = TextView(this).apply {
+        dirBubbleSubtitle = TextView(this).apply {
             text = "Сейчас: $logDirLabel"
             textSize = 12f
             setTextColor(TEXT_MUTED)
+            setPadding(0, dp(4).toInt(), 0, 0)
         }
-        content.addView(
-            makeSettingsAction(
-                title = "Место сохранения лога",
-                subtitleView = logDirSubtitle,
-                buttonLabel = "Выбрать",
-                onClick = { openLogDirPicker() }
-            )
-        )
+        bubble.addView(dirBubbleSubtitle)
 
-        // 3. Блокировка ориентации
-        content.addView(
-            makeSettingsRow(
-                title = "Блокировка ориентации",
-                subtitle = "Всегда вертикальный экран",
-                key = KEY_LOCK_ORIENTATION,
-                defaultValue = false,
-                onApplied = { applyOrientationLock() }
-            )
-        )
-
-        // 4. Работа в фоне
-        content.addView(
-            makeSettingsRow(
-                title = "Работа в фоне",
-                subtitle = "Держать чат живым, когда приложение свернуто",
-                key = KEY_BACKGROUND,
-                defaultValue = true,
-                onApplied = { }
-            )
-        )
-
-        val done = Button(this).apply {
-            text = "Готово"
-            setTextColor(TEXT_MAIN)
-            background = pillDrawable(BTN_BG, 28f)
-            setPadding(64, 28, 64, 28)
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = gap; gravity = Gravity.CENTER_HORIZONTAL }
-            setOnClickListener { toggleSettingsPanel() }
-        }
-        content.addView(done)
-
-        return ScrollView(this).apply {
-            setBackgroundColor(BG_DARK)
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }.also { it.addView(content) }
-    }
-
-    // Строка настройки: карточка с названием, пояснением и пилюлей-выключателем.
-    // Изменения пишутся в prefs и сразу применяются через onApplied
-    private fun makeSettingsRow(
-        title: String,
-        subtitle: String,
-        key: String,
-        defaultValue: Boolean,
-        onApplied: () -> Unit
-    ): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply {
-                setColor(CARD_BG)
-                cornerRadius = dp(16)
-            }
-            setPadding(dp(16).toInt(), dp(14).toInt(), dp(16).toInt(), dp(14).toInt())
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12).toInt() }
+            ).apply { topMargin = dp(12).toInt() }
         }
 
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
-            )
-        }
-
-        val titleView = TextView(this).apply {
-            text = title
-            textSize = 16f
+        val pick = TextView(this).apply {
+            text = "Выбрать"
+            textSize = 13f
             setTextColor(TEXT_MAIN)
+            setPadding(30, 14, 30, 14)
+            background = pillDrawable(BTN_BG, 22f)
+            setOnClickListener { openLogDirPicker() }
         }
-        val subtitleView = TextView(this).apply {
-            text = subtitle
-            textSize = 12f
+        actions.addView(pick)
+
+        val close = TextView(this).apply {
+            text = "✕"
+            textSize = 15f
             setTextColor(TEXT_MUTED)
-        }
-        textCol.addView(titleView)
-        textCol.addView(subtitleView)
-
-        var switchOn = prefs.getBoolean(key, defaultValue)
-        val switchPill = TextView(this).apply {
-            textSize = 12f
-            setPadding(28, 12, 28, 12)
+            setPadding(dp(16).toInt(), 14, dp(16).toInt(), 14)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = dp(12).toInt() }
+            ).apply { marginStart = dp(8).toInt() }
+            setOnClickListener { hideDirBubble() }
         }
+        actions.addView(close)
 
-        fun updateLook() {
-            switchPill.background = GlowPillDrawable(switchOn)
-            switchPill.setTextColor(if (switchOn) GREEN_BRIGHT else TEXT_MUTED)
-            switchPill.text = if (switchOn) "Вкл" else "Выкл"
-        }
-        updateLook()
-
-        fun toggle() {
-            switchOn = !switchOn
-            prefs.edit().putBoolean(key, switchOn).apply()
-            updateLook()
-            log("app", "$title: ${if (switchOn) "вкл" else "выкл"}")
-            onApplied()
-        }
-
-        row.setOnClickListener { toggle() }
-        switchPill.setOnClickListener { toggle() }
-
-        row.addView(textCol)
-        row.addView(switchPill)
-        return row
+        bubble.addView(actions)
+        return bubble
     }
 
-    // Строчка-действие в настройках: карточка с кнопкой вместо выключателя
-    private fun makeSettingsAction(
-        title: String,
-        subtitleView: TextView,
-        buttonLabel: String,
-        onClick: () -> Unit
-    ): LinearLayout {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            background = GradientDrawable().apply {
-                setColor(CARD_BG)
-                cornerRadius = dp(16)
-            }
-            setPadding(dp(16).toInt(), dp(14).toInt(), dp(16).toInt(), dp(14).toInt())
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(12).toInt() }
-        }
+    private fun showDirBubble() {
+        dirBubble.visibility = View.VISIBLE
+        log("app", "пузырь лога открыт")
+    }
 
-        val textCol = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = LinearLayout.LayoutParams(
-                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
-            )
-        }
-
-        val titleView = TextView(this).apply {
-            text = title
-            textSize = 16f
-            setTextColor(TEXT_MAIN)
-        }
-        textCol.addView(titleView)
-        textCol.addView(subtitleView)
-
-        val pill = TextView(this).apply {
-            text = buttonLabel
-            textSize = 12f
-            setTextColor(TEXT_MAIN)
-            setPadding(28, 12, 28, 12)
-            background = GlowPillDrawable(false)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { marginStart = dp(12).toInt() }
-            setOnClickListener { onClick() }
-        }
-
-        row.addView(textCol)
-        row.addView(pill)
-        return row
+    private fun hideDirBubble() {
+        dirBubble.visibility = View.GONE
     }
 
     // Выбор папки для лога: системный SAF-пикер, доступ закрепляется навсегда
@@ -991,15 +977,8 @@ return out.join(' | ');
     // --- Жизненный цикл ---
 
     override fun onBackPressed() {
-        if (this::settingsPanel.isInitialized &&
-            settingsPanel.visibility == android.view.View.VISIBLE
-        ) {
-            toggleSettingsPanel()
-            return
-        }
-        if (this::webView.isInitialized && webView.canGoBack()) {
-            webView.goBack()
-        } else {
+        performBack() // единая логика с жестом: пузырь, потом история
+        if (!this::webView.isInitialized || !webView.canGoBack()) {
             super.onBackPressed()
         }
     }
@@ -1008,6 +987,9 @@ return out.join(' | ');
         super.onResume()
         // Вернулись в приложение — служба больше не нужна, чат продолжается на экране
         stopService(Intent(this, KeepAliveService::class.java))
+        // Блокировка ориентации переприменяется при каждом выходе на передний план,
+        // чтобы настройка не «отклеивалась» после системных событий
+        applyOrientationLock()
     }
 
     override fun onPause() {
@@ -1206,60 +1188,5 @@ return out.join(' | ');
             super.onReceivedHttpError(view, request, errorResponse)
             log("err", "HTTP ${errorResponse?.statusCode} ${request?.url}")
         }
-    }
-
-    // --- Зелёный ореол вокруг пилюль: концентрические полупрозрачные кольца
-    // с затухающей яркостью — эффект мягкого свечения без капризного blur ---
-    private inner class GlowPillDrawable(private val active: Boolean) : Drawable() {
-
-        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.STROKE
-        }
-
-        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-        }
-
-        private fun dp(v: Int): Float = v * resources.displayMetrics.density
-
-        override fun draw(canvas: android.graphics.Canvas) {
-            val b = bounds
-            val pad = dp(6) // зона под свечение внутри границ view
-            val left = b.left + pad
-            val top = b.top + pad
-            val right = b.right - pad
-            val bottom = b.bottom - pad
-            val radius = (bottom - top) / 2f
-
-            if (active) {
-                val rings = 5
-                for (i in rings downTo 1) {
-                    val grow = (pad / rings) * i
-                    val alpha = 56 / i // 56, 28, 18, 14, 11 — чем дальше от пилюли, тем тусклее
-                    glowPaint.color = Color.argb(
-                        alpha,
-                        Color.red(GREEN_BRIGHT),
-                        Color.green(GREEN_BRIGHT),
-                        Color.blue(GREEN_BRIGHT)
-                    )
-                    glowPaint.strokeWidth = pad / rings
-                    canvas.drawRoundRect(
-                        left - grow, top - grow, right + grow, bottom + grow,
-                        radius + grow, radius + grow, glowPaint
-                    )
-                }
-            }
-
-            // Сама пилюля — чуть меньше прежней, чтобы освободить место под ореол
-            fillPaint.color = Color.parseColor("#AA2E2E3A")
-            canvas.drawRoundRect(left, top, right, bottom, radius, radius, fillPaint)
-        }
-
-        override fun setAlpha(alpha: Int) { /* прозрачность управляется цветами */ }
-
-        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) { /* не нужно */ }
-
-        @Deprecated("Deprecated in Java")
-        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
     }
 }

@@ -9,6 +9,7 @@ import android.content.SharedPreferences
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
 import android.content.res.ColorStateList
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.PixelFormat
@@ -41,6 +42,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.TextView
+import android.widget.Toast
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -51,7 +53,7 @@ import kotlin.random.Random
 class MainActivity : Activity() {
 
     companion object {
-        // Тёмная палитра
+        // Тёмная палитра интерфейса приложения
         private val BG_DARK = Color.parseColor("#141419")
         private val CARD_BG = Color.parseColor("#1E1E26")
         private val BAR_BG = Color.parseColor("#191921")
@@ -62,12 +64,14 @@ class MainActivity : Activity() {
 
         // Зелёная подсветка включённых переключателей
         private val GREEN_BRIGHT = Color.parseColor("#FF4CAF50")
+        private val DOT_OFF = Color.parseColor("#4A4A55")
 
         private const val PREFS_NAME = "alice_lite_prefs"
         private const val KEY_FORCE_DARK = "force_dark"
         private const val KEY_LOGGING = "logging_enabled"
         private const val KEY_LOCK_ORIENTATION = "lock_orientation"
-        private const val KEY_BACKGROUND = "background_enabled"
+        // Новый ключ: фон выключен по умолчанию, старое значение не наследуется
+        private const val KEY_BACKGROUND = "background_enabled_v2"
         private const val KEY_LAST_URL = "last_url"
         private const val KEY_LOG_DIR = "log_dir_uri"
         private const val KEY_LOG_DIR_LABEL = "log_dir_label"
@@ -104,11 +108,12 @@ class MainActivity : Activity() {
     private lateinit var funnyText: TextView
     private lateinit var realErrorText: TextView
 
-    // Нижний бар с иконками-переключателями и пузырь настроек лога
+    // Нижний бар: ячейки переключателей и пузырь настроек лога
     private lateinit var bottomBar: LinearLayout
-    private lateinit var themeIcon: TextView
-    private lateinit var orientIcon: TextView
-    private lateinit var logIcon: TextView
+    private lateinit var cellTheme: LinearLayout
+    private lateinit var cellOrient: LinearLayout
+    private lateinit var cellBackground: LinearLayout
+    private lateinit var cellLog: LinearLayout
     private lateinit var gearIcon: TextView
     private lateinit var dirBubble: LinearLayout
     private lateinit var dirBubbleSubtitle: TextView
@@ -116,7 +121,7 @@ class MainActivity : Activity() {
     private var forceDarkOn = true
     private var loggingEnabled = true
     private var lockOrientationOn = false
-    private var backgroundEnabled = true
+    private var backgroundEnabled = false
     private var lastLoggedProgress = -20
     private var httpRetries = 0
     private var errorSincePageStart = false
@@ -156,7 +161,24 @@ class MainActivity : Activity() {
 
     private fun barHeightPx(): Int = dp(56).toInt()
 
+    // Принудительный ночной режим конфигурации: алгоритмическое затемнение
+    // WebView срабатывает только когда приложение находится в тёмном режиме.
+    // Применяется строго до super.onCreate — после создания активити систему
+    // уже не переубедить. Само затемнение страницей управляется тумблером
+    // через isAlgorithmicDarkeningAllowed: выкл — страница рисует свои светлые
+    // цвета, вкл — движок их затемняет. Ночной конфиг при этом не меняется
+    private fun applyNightConfiguration() {
+        try {
+            val config = Configuration(resources.configuration)
+            config.uiMode =
+                (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                    Configuration.UI_MODE_NIGHT_YES
+            applyOverrideConfiguration(config)
+        } catch (e: Exception) { /* тихо: тогда сработает только reflection-путь */ }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        applyNightConfiguration()
         super.onCreate(savedInstanceState)
 
         // Перехватчик падений: лог выгружается в тот же файл через единый канал,
@@ -174,7 +196,7 @@ class MainActivity : Activity() {
         forceDarkOn = prefs.getBoolean(KEY_FORCE_DARK, true)
         loggingEnabled = prefs.getBoolean(KEY_LOGGING, true)
         lockOrientationOn = prefs.getBoolean(KEY_LOCK_ORIENTATION, false)
-        backgroundEnabled = prefs.getBoolean(KEY_BACKGROUND, true)
+        backgroundEnabled = prefs.getBoolean(KEY_BACKGROUND, false)
         logDirUri = prefs.getString(KEY_LOG_DIR, null)?.let { Uri.parse(it) }
         logDirLabel = prefs.getString(KEY_LOG_DIR_LABEL, null) ?: "Загрузки"
 
@@ -296,7 +318,7 @@ class MainActivity : Activity() {
             setSupportMultipleWindows(true) // без этого onCreateWindow не срабатывает вовсе
             allowFileAccess = true
             cacheMode = WebSettings.LOAD_DEFAULT
-            // User-Agent НЕ подменяем: WebView представляется сам (Chrome 157),
+            // User-Agent НЕ подменяем: WebView представляется сам,
             // а сайт раздаёт бандлы под настоящую версию движка
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
@@ -356,24 +378,26 @@ class MainActivity : Activity() {
         }
     }
 
-    // --- Тёмная тема: алгоритмическое затемнение (преемник форс-дарка) ---
-    // На Android 13+ включаем setAlgorithmicDarkeningAllowed. На более старых
-    // версиях метод setForceDark отсутствует в новых SDK, поэтому вызываем
-    // его через reflection с числовыми значениями (1 = выкл, 2 = вкл)
+    // --- Тёмная тема ---
+    // Основной путь на Android 13+: isAlgorithmicDarkeningAllowed. Ночной режим
+    // конфигурации включён постоянно (applyNightConfiguration до onCreate),
+    // поэтому тумблер работает в обе стороны. Резервный путь для старых версий:
+    // setForceDark через reflection (1 = выкл, 2 = вкл)
     private fun applyForceDark() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             webView.settings.isAlgorithmicDarkeningAllowed = forceDarkOn
+            log("app", "тёмная тема: ${if (forceDarkOn) "вкл" else "выкл"}")
         } else {
             try {
                 val m = webView.settings.javaClass.getMethod(
                     "setForceDark", Int::class.javaPrimitiveType
                 )
                 m.invoke(webView.settings, if (forceDarkOn) 2 else 1)
+                log("app", "форс-дарк: ${if (forceDarkOn) "вкл" else "выкл"}")
             } catch (e: Exception) {
                 log("app", "затемнение недоступно на этой версии: $e")
             }
         }
-        log("app", "тёмная тема: ${if (forceDarkOn) "вкл" else "выкл"}")
     }
 
     // --- Блокировка ориентации ---
@@ -738,7 +762,52 @@ return out.join(' | ');
         return box
     }
 
-    // --- Нижний бар: иконки-переключатели слева, шестерёнка справа ---
+    // --- Нижний бар: иконки-переключатели с точками состояния, шестерёнка справа ---
+
+    // Ячейка переключателя: эмодзи сверху, точка-индикатор снизу.
+    // Эмодзи не перекрашиваются средствами системы, поэтому состояние показывают
+    // точка (● зелёная / ○ серая) и зелёный ореол вокруг ячейки
+    private fun makeBarToggle(emoji: String): LinearLayout {
+        val cell = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(
+                dp(52).toInt(), ViewGroup.LayoutParams.MATCH_PARENT
+            ).apply { setMargins(dp(2).toInt(), 0, dp(2).toInt(), 0) }
+        }
+
+        val emojiView = TextView(this).apply {
+            text = emoji
+            textSize = 20f
+            gravity = Gravity.CENTER
+        }
+
+        val dot = TextView(this).apply {
+            textSize = 9f
+            gravity = Gravity.CENTER
+            text = "○"
+        }
+
+        cell.tag = emojiView to dot
+        return cell
+    }
+
+    // Обновление вида ячейки: точка и ореол отражают состояние
+    private fun refreshToggle(cell: LinearLayout, on: Boolean) {
+        val pair = cell.tag as Pair<TextView, TextView>
+        val emojiView = pair.first
+        val dot = pair.second
+
+        emojiView.background = if (on) GlowPillDrawable(true) else null
+        emojiView.setPadding(dp(8).toInt(), dp(4).toInt(), dp(8).toInt(), dp(2).toInt())
+
+        dot.text = if (on) "●" else "○"
+        dot.setTextColor(if (on) GREEN_BRIGHT else DOT_OFF)
+    }
+
+    private fun announce(message: String) {
+        Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+    }
 
     private fun makeBottomBar(): LinearLayout {
         val bar = LinearLayout(this).apply {
@@ -752,7 +821,7 @@ return out.join(' | ');
             )
         }
 
-        // Левая группа: три переключателя по центру оставшегося места
+        // Левая группа: четыре переключателя по центру оставшегося места
         val leftGroup = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
@@ -761,61 +830,72 @@ return out.join(' | ');
             )
         }
 
-        fun barIcon(symbol: String): TextView {
-            return TextView(this).apply {
-                text = symbol
-                textSize = 22f
-                setPadding(dp(14).toInt(), 0, dp(14).toInt(), 0)
-                gravity = Gravity.CENTER
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.WRAP_CONTENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT
-                )
-            }
-        }
-
-        themeIcon = barIcon(if (forceDarkOn) "🌙" else "☀️")
-        themeIcon.setOnClickListener {
+        val themeCell = makeBarToggle("🌙")
+        themeCell.setOnClickListener {
             forceDarkOn = !forceDarkOn
             prefs.edit().putBoolean(KEY_FORCE_DARK, forceDarkOn).apply()
             applyForceDark()
             refreshBarIcons()
+            announce(if (forceDarkOn) "Тёмная тема: вкл" else "Тёмная тема: выкл")
             if (this::webView.isInitialized) webView.reload() // тема применяется к следующей загрузке
         }
 
-        orientIcon = barIcon(if (lockOrientationOn) "🔒" else "🔓")
-        orientIcon.setOnClickListener {
+        val orientCell = makeBarToggle("🔒")
+        orientCell.setOnClickListener {
             lockOrientationOn = !lockOrientationOn
             prefs.edit().putBoolean(KEY_LOCK_ORIENTATION, lockOrientationOn).apply()
             applyOrientationLock()
             refreshBarIcons()
+            announce(if (lockOrientationOn) "Экран зафиксирован" else "Экран свободен")
         }
 
-        logIcon = barIcon("📝")
-        logIcon.setOnClickListener {
+        val bgCell = makeBarToggle("🔄")
+        bgCell.setOnClickListener {
+            backgroundEnabled = !backgroundEnabled
+            prefs.edit().putBoolean(KEY_BACKGROUND, backgroundEnabled).apply()
+            if (!backgroundEnabled) {
+                // Служба могла остаться от прошлого сворачивания — глушим сразу
+                stopService(Intent(this, KeepAliveService::class.java))
+            }
+            refreshBarIcons()
+            announce(if (backgroundEnabled) "Фон: вкл" else "Фон: выкл")
+            log("app", "работа в фоне: ${if (backgroundEnabled) "вкл" else "выкл"}")
+        }
+
+        val logCell = makeBarToggle("📝")
+        logCell.setOnClickListener {
             loggingEnabled = !loggingEnabled
             prefs.edit().putBoolean(KEY_LOGGING, loggingEnabled).apply()
             if (!loggingEnabled) hideDirBubble()
             refreshBarIcons()
+            announce(if (loggingEnabled) "Лог: вкл" else "Лог: выкл")
             log("app", "запись лога: ${if (loggingEnabled) "вкл" else "выкл"}")
         }
 
-        leftGroup.addView(themeIcon)
-        leftGroup.addView(orientIcon)
-        leftGroup.addView(logIcon)
+        // Сохраняем ссылки на ячейки для обновления вида при старте и возврате
+        cellTheme = themeCell
+        cellOrient = orientCell
+        cellBackground = bgCell
+        cellLog = logCell
+
+        leftGroup.addView(themeCell)
+        leftGroup.addView(orientCell)
+        leftGroup.addView(bgCell)
+        leftGroup.addView(logCell)
         bar.addView(leftGroup)
 
         gearIcon = TextView(this).apply {
             text = "⚙️"
-            textSize = 22f
+            textSize = 20f
             gravity = Gravity.CENTER
-            setPadding(dp(20).toInt(), 0, dp(20).toInt(), 0)
+            setPadding(dp(18).toInt(), 0, dp(18).toInt(), 0)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
             setOnClickListener {
                 if (!loggingEnabled) {
+                    announce("Шестерёнка: включите запись лога (📝)")
                     log("app", "шестерёнка неактивна: запись лога выключена")
                     return@setOnClickListener
                 }
@@ -832,18 +912,14 @@ return out.join(' | ');
         return bar
     }
 
-    // Обновление вида иконок: зелёный цвет — включено, приглушённый — выключено.
-    // Шестерёнка активна только при включённой записи лога
+    // Обновление всех индикаторов: вызывается при старте и при возврате в активити
     private fun refreshBarIcons() {
-        themeIcon.text = if (forceDarkOn) "🌙" else "☀️"
-        themeIcon.setTextColor(if (forceDarkOn) GREEN_BRIGHT else TEXT_MUTED)
+        if (!this::cellTheme.isInitialized) return
+        refreshToggle(cellTheme, forceDarkOn)
+        refreshToggle(cellOrient, lockOrientationOn)
+        refreshToggle(cellBackground, backgroundEnabled)
+        refreshToggle(cellLog, loggingEnabled)
 
-        orientIcon.text = if (lockOrientationOn) "🔒" else "🔓"
-        orientIcon.setTextColor(if (lockOrientationOn) GREEN_BRIGHT else TEXT_MUTED)
-
-        logIcon.setTextColor(if (loggingEnabled) GREEN_BRIGHT else TEXT_MUTED)
-
-        gearIcon.setTextColor(if (loggingEnabled) TEXT_MAIN else Color.parseColor("#4A4A55"))
         gearIcon.alpha = if (loggingEnabled) 1f else 0.45f
     }
 
@@ -990,12 +1066,19 @@ return out.join(' | ');
         // Блокировка ориентации переприменяется при каждом выходе на передний план,
         // чтобы настройка не «отклеивалась» после системных событий
         applyOrientationLock()
+        // Индикаторы могли устареть, пока активити пересоздавалась
+        refreshBarIcons()
     }
 
     override fun onPause() {
         super.onPause()
-        // Пока приложение свернуто, служба держит процесс живым — если она разрешена
-        if (backgroundEnabled) startKeepAliveService()
+        // Служба держит процесс живым, пока приложение свернуто — только если
+        // фон разрешён. Иначе глушим, чтобы шторка не висела зря
+        if (backgroundEnabled) {
+            startKeepAliveService()
+        } else {
+            stopService(Intent(this, KeepAliveService::class.java))
+        }
         // Запоминаем последнюю открытую страницу
         val url = webView.url
         if (!url.isNullOrEmpty()) {
@@ -1188,5 +1271,59 @@ return out.join(' | ');
             super.onReceivedHttpError(view, request, errorResponse)
             log("err", "HTTP ${errorResponse?.statusCode} ${request?.url}")
         }
+    }
+
+    // --- Зелёный ореол вокруг активных переключателей: концентрические
+    // полупрозрачные кольца с затухающей яркостью — мягкое свечение без blur ---
+    private inner class GlowPillDrawable(private val active: Boolean) : Drawable() {
+
+        private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+
+        private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+        }
+
+        private fun dp(v: Int): Float = v * resources.displayMetrics.density
+
+        override fun draw(canvas: android.graphics.Canvas) {
+            val b = bounds
+            val pad = dp(5)
+            val left = b.left + pad
+            val top = b.top + pad
+            val right = b.right - pad
+            val bottom = b.bottom - pad
+            val radius = (bottom - top) / 2f
+
+            if (active) {
+                val rings = 4
+                for (i in rings downTo 1) {
+                    val grow = (pad / rings) * i
+                    val alpha = 50 / i
+                    glowPaint.color = Color.argb(
+                        alpha,
+                        Color.red(GREEN_BRIGHT),
+                        Color.green(GREEN_BRIGHT),
+                        Color.blue(GREEN_BRIGHT)
+                    )
+                    glowPaint.strokeWidth = pad / rings
+                    canvas.drawRoundRect(
+                        left - grow, top - grow, right + grow, bottom + grow,
+                        radius + grow, radius + grow, glowPaint
+                    )
+                }
+            }
+
+            fillPaint.color = Color.parseColor("#66303A46")
+            canvas.drawRoundRect(left, top, right, bottom, radius, radius, fillPaint)
+        }
+
+        override fun setAlpha(alpha: Int) { /* прозрачность управляется цветами */ }
+
+        override fun setColorFilter(colorFilter: android.graphics.ColorFilter?) { /* не нужно */ }
+
+        @Deprecated("Deprecated in Java")
+        override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
     }
 }

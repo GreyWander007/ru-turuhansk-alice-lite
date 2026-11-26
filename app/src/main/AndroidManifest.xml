@@ -7,6 +7,10 @@
     <!-- Фоновая служба-хранитель процесса (Android 9+) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
+    <!-- Пара к foregroundServiceType="dataSync": без неё на Android 14+
+         служба падает с SecurityException и уносит всё приложение -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
     <!-- Уведомление «Алиса активна» (Android 13+ запрашивается в рантайме) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 

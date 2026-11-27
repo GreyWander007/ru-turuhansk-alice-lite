@@ -788,6 +788,9 @@ return out.join(' | ');
             text = "○"
         }
 
+        // Вьюхи обязаны быть прикреплены к ячейке — без addView они невидимы
+        cell.addView(emojiView)
+        cell.addView(dot)
         cell.tag = emojiView to dot
         return cell
     }

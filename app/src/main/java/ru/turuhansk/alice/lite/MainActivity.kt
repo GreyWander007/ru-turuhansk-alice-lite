@@ -128,6 +128,9 @@ class MainActivity : Activity() {
     private var logDirUri: Uri? = null
     private var logDirLabel = "Загрузки"
 
+    // Пересоздание активити ради смены темы: гасит лишний запуск фоновой службы
+    private var recreatingForTheme = false
+
     // Для выбора файлов
     private var filePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingFileParams: WebChromeClient.FileChooserParams? = null
@@ -161,19 +164,20 @@ class MainActivity : Activity() {
 
     private fun barHeightPx(): Int = dp(56).toInt()
 
-    // Принудительный ночной режим конфигурации: алгоритмическое затемнение
-    // WebView срабатывает только когда приложение находится в тёмном режиме.
-    // Применяется строго до super.onCreate — после создания активити систему
-    // уже не переубедить. Само затемнение страницей управляется тумблером
-    // через isAlgorithmicDarkeningAllowed: выкл — страница рисует свои светлые
-    // цвета, вкл — движок их затемняет. Ночной конфиг при этом не меняется
+    // Ночной режим конфигурации следует за тумблером темы: сайт Алисы определяет
+    // тему по prefers-color-scheme, поэтому «выкл» должен быть днём, иначе
+    // сайт сам отдаст тёмную тему. Применяется строго до super.onCreate,
+    // поэтому переключение выполняется через recreate()
     private fun applyNightConfiguration() {
+        val dark = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            .getBoolean(KEY_FORCE_DARK, true)
         try {
             val config = Configuration(resources.configuration)
             config.uiMode =
                 (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
-                    Configuration.UI_MODE_NIGHT_YES
+                    (if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO)
             applyOverrideConfiguration(config)
+            log("app", "ночной конфиг: ${if (dark) "тёмный" else "светлый"}")
         } catch (e: Exception) { /* тихо: тогда сработает только reflection-путь */ }
     }
 
@@ -380,9 +384,9 @@ class MainActivity : Activity() {
 
     // --- Тёмная тема ---
     // Основной путь на Android 13+: isAlgorithmicDarkeningAllowed. Ночной режим
-    // конфигурации включён постоянно (applyNightConfiguration до onCreate),
-    // поэтому тумблер работает в обе стороны. Резервный путь для старых версий:
-    // setForceDark через reflection (1 = выкл, 2 = вкл)
+    // конфигурации включается вместе с тумблером (applyNightConfiguration до
+    // onCreate), поэтому тумблер работает в обе стороны. Резервный путь для
+    // старых версий: setForceDark через reflection (1 = выкл, 2 = вкл)
     private fun applyForceDark() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             webView.settings.isAlgorithmicDarkeningAllowed = forceDarkOn
@@ -837,10 +841,11 @@ return out.join(' | ');
         themeCell.setOnClickListener {
             forceDarkOn = !forceDarkOn
             prefs.edit().putBoolean(KEY_FORCE_DARK, forceDarkOn).apply()
-            applyForceDark()
-            refreshBarIcons()
             announce(if (forceDarkOn) "Тёмная тема: вкл" else "Тёмная тема: выкл")
-            if (this::webView.isInitialized) webView.reload() // тема применяется к следующей загрузке
+            // Ночной конфиг применяется только до super.onCreate,
+            // поэтому пересоздаём активити: состояние чата восстановится само
+            recreatingForTheme = true
+            recreate()
         }
 
         val orientCell = makeBarToggle("🔒")
@@ -1076,8 +1081,9 @@ return out.join(' | ');
     override fun onPause() {
         super.onPause()
         // Служба держит процесс живым, пока приложение свернуто — только если
-        // фон разрешён. Иначе глушим, чтобы шторка не висела зря
-        if (backgroundEnabled) {
+        // фон разрешён. Иначе глушим. При пересоздании ради темы службу не
+        // запускаем: старая копия активити сейчас умирает
+        if (backgroundEnabled && !recreatingForTheme) {
             startKeepAliveService()
         } else {
             stopService(Intent(this, KeepAliveService::class.java))

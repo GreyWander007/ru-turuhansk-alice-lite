@@ -2,6 +2,7 @@ package ru.turuhansk.alice.lite
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.app.UiModeManager
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Intent
@@ -151,11 +152,11 @@ class MainActivity : Activity() {
         "DNS отказался отвечать. Он тоже удивлён.",
         "Не удалось сохранить лог ошибки об ошибке.",
         "Интернет не подключён. Просто поверьте.",
-        "Это работает? 1",
+        "Это работает?",
         "Загрузка видео завершена. Скачалось: ничего.",
         "Часовой пояс не найден. Зима близко.",
         "Данных нет. Всё хорошо.",
-        "Памяти достаточно? 1",
+        "Памяти достаточно?",
         "Котэ настучал на сервер лапой. Сервер не ответил.",
         "Сервер ушёл на обед. Возвращается, когда захочет.",
         "Мы посчитали. Не сошлось. Считать умеем, но не хотим.",
@@ -164,25 +165,26 @@ class MainActivity : Activity() {
 
     private fun barHeightPx(): Int = dp(56).toInt()
 
-    // Ночной режим конфигурации следует за тумблером темы: сайт Алисы определяет
-    // тему по prefers-color-scheme, поэтому «выкл» должен быть днём, иначе
-    // сайт сам отдаст тёмную тему. Применяется строго до super.onCreate,
-    // поэтому переключение выполняется через recreate()
-    private fun applyNightConfiguration() {
-        val dark = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            .getBoolean(KEY_FORCE_DARK, true)
-        try {
-            val config = Configuration(resources.configuration)
-            config.uiMode =
-                (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
-                    (if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO)
-            applyOverrideConfiguration(config)
-            log("app", "ночной конфиг: ${if (dark) "тёмный" else "светлый"}")
-        } catch (e: Exception) { /* тихо: тогда сработает только reflection-путь */ }
+    // Резервный путь для Android ниже 12: ночной конфигурации принудительно
+    // задаётся ДО super.onCreate, как того требует applyOverrideConfiguration.
+    // На Android 12 и новее этот путь не используется — там работает
+    // системный режим приложения через UiModeManager (applyAppNightMode)
+    private fun applyNightConfigurationLegacy() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            val dark = getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getBoolean(KEY_FORCE_DARK, true)
+            try {
+                val config = Configuration(resources.configuration)
+                config.uiMode =
+                    (config.uiMode and Configuration.UI_MODE_NIGHT_MASK.inv()) or
+                        (if (dark) Configuration.UI_MODE_NIGHT_YES else Configuration.UI_MODE_NIGHT_NO)
+                applyOverrideConfiguration(config)
+            } catch (e: Exception) { /* тихо: сработает reflection-путь из applyForceDark */ }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        applyNightConfiguration()
+        applyNightConfigurationLegacy()
         super.onCreate(savedInstanceState)
 
         // Перехватчик падений: лог выгружается в тот же файл через единый канал,
@@ -206,6 +208,10 @@ class MainActivity : Activity() {
 
         log("app", "onCreate: запуск")
         logWebViewVersion()
+
+        // Системный ночной режим приложения: именно по нему WebView вычисляет
+        // prefers-color-scheme. Ставится один раз, дальше система хранит его сама
+        applyAppNightMode()
 
         // Разрешение на уведомления: без него на Android 13+ шторка молчит,
         // хотя служба-то работает
@@ -279,7 +285,8 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
-        // Тема применяется сразу при старте — из сохранённых настроек
+        // Алгоритмическое затемнение выключенных тем сайтов — поверх собственного
+        // тёмного оформления применяется только при включённой теме
         applyForceDark()
 
         // Восстановление сессии: если система пересоздала активити — возвращаем
@@ -290,6 +297,39 @@ class MainActivity : Activity() {
             val lastUrl = prefs.getString(KEY_LAST_URL, null) ?: DEFAULT_URL
             log("app", "открываем сохранённую страницу: $lastUrl")
             webView.loadUrl(lastUrl)
+        }
+    }
+
+    // Системный ночной режим для приложения (Android 12+): это тот же
+    // переключатель, что в системных настройках «Тёмная тема для этого
+    // приложения», и именно по нему WebView вычисляет prefers-color-scheme.
+    // При смене режима система сама пересоздаёт активити; если режим уже
+    // верный, а конфигурация экрана расходится — пересоздаём вручную
+    private fun applyAppNightMode() {
+        val dark = prefs.getBoolean(KEY_FORCE_DARK, true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            try {
+                val umm = getSystemService(UI_MODE_SERVICE) as UiModeManager
+                val wanted =
+                    if (dark) UiModeManager.MODE_NIGHT_YES else UiModeManager.MODE_NIGHT_NO
+                if (umm.nightMode != wanted) {
+                    umm.setApplicationNightMode(wanted)
+                    log("app", "ночной режим приложения: ${if (dark) "вкл" else "выкл"} — система пересоздаст экран")
+                } else {
+                    val cfgNight =
+                        (resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK) ==
+                            Configuration.UI_MODE_NIGHT_YES
+                    if (cfgNight != dark) {
+                        log("app", "режим уже ${if (dark) "вкл" else "выкл"}, конфиг расходится — пересоздаём экран")
+                        recreatingForTheme = true
+                        recreate()
+                    } else {
+                        log("app", "ночной режим приложения: ${if (dark) "вкл" else "выкл"} (без изменений)")
+                    }
+                }
+            } catch (e: Exception) {
+                log("app", "системный ночной режим недоступен: $e")
+            }
         }
     }
 
@@ -383,14 +423,13 @@ class MainActivity : Activity() {
     }
 
     // --- Тёмная тема ---
-    // Основной путь на Android 13+: isAlgorithmicDarkeningAllowed. Ночной режим
-    // конфигурации включается вместе с тумблером (applyNightConfiguration до
-    // onCreate), поэтому тумблер работает в обе стороны. Резервный путь для
-    // старых версий: setForceDark через reflection (1 = выкл, 2 = вкл)
+    // Системный ночной режим приложения (UiModeManager) управляет тем, что видит
+    // сайт. Алгоритмическое затемнение включается только при тёмной теме —
+    // для затемнения страниц без собственной тёмной темы
     private fun applyForceDark() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             webView.settings.isAlgorithmicDarkeningAllowed = forceDarkOn
-            log("app", "тёмная тема: ${if (forceDarkOn) "вкл" else "выкл"}")
+            log("app", "алгоритмическое затемнение: ${if (forceDarkOn) "вкл" else "выкл"}")
         } else {
             try {
                 val m = webView.settings.javaClass.getMethod(
@@ -637,7 +676,8 @@ return out.join(' | ');
         }
     }
 
-    // Проба живости: загрузился ли бандл React и смонтировалось ли приложение
+    // Проба живости: загрузился ли бандл React, смонтировалось ли приложение
+    // и какую тему видит сама страница — телеметрия напрямую с сайта
     private fun jsProbe(wv: WebView, reason: String) {
         val script = """
 (function(){
@@ -646,12 +686,23 @@ return out.join(' | ');
     pageFound: !!page,
     pageChildren: page?page.childElementCount:0,
     readyState: document.readyState,
-    bodyLen: document.body?document.body.innerHTML.length:0
+    bodyLen: document.body?document.body.innerHTML.length:0,
+    dark: window.matchMedia('(prefers-color-scheme: dark)').matches
   });
 })();
 """.trimIndent()
 
-        wv.evaluateJavascript(script) { r -> log("probe", "$reason: $r") }
+        wv.evaluateJavascript(script) { r ->
+            val dark = try {
+                // Вытаскиваем поле dark из ответа для читаемой строки в логе
+                val m = Regex("\"dark\":(true|false)").find(r ?: "")
+                m?.groupValues?.get(1)
+            } catch (e: Exception) { null }
+            if (dark != null) {
+                log("probe", "$reason: страница видит тему — ${if (dark == "true") "тёмную" else "светлую"}")
+            }
+            log("probe", "$reason: $r")
+        }
     }
 
     // --- Оформление ---
@@ -842,10 +893,10 @@ return out.join(' | ');
             forceDarkOn = !forceDarkOn
             prefs.edit().putBoolean(KEY_FORCE_DARK, forceDarkOn).apply()
             announce(if (forceDarkOn) "Тёмная тема: вкл" else "Тёмная тема: выкл")
-            // Ночной конфиг применяется только до super.onCreate,
-            // поэтому пересоздаём активити: состояние чата восстановится само
+            // Смена системного ночного режима пересоздаёт экран сама;
+            // флаг гасит лишний запуск фоновой службы в умирающей копии
             recreatingForTheme = true
-            recreate()
+            applyAppNightMode()
         }
 
         val orientCell = makeBarToggle("🔒")
